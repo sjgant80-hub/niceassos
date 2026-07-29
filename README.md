@@ -125,9 +125,13 @@ data-driven routing, proof-of-play admission, the cascade tiering, the
 launch→signed-`fork_join` loop, and **cross-machine federation** (relay carrier +
 sign/chain/replay verification on receipt).
 
-**Next:** relay-through gossip (so machines that can't form a *direct* WebRTC link
-still exchange through a common peer); the full estate app set mounted as gated
-organs; the remote AI tier wired in-browser (today it's the si-didy-agent cockpit).
+Two machines that can't form a *direct* WebRTC link still exchange via **relay-through
+gossip** — any machine re-forwards a received envelope to its other peers (loops
+stopped by the ledger + dedup). On by default; `opts.gossip:false` for a pure mesh.
+
+**Next:** the full estate app set mounted as gated organs; the remote AI tier wired
+in-browser (today it's the si-didy-agent cockpit); a spanning-tree gossip overlay to
+cut the flood's redundant sends on large meshes.
 
 ## License
 

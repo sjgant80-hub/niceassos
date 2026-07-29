@@ -1814,7 +1814,8 @@ async function initMesh() {
       logEvent('MESH', `federation → dialing ${url} · room ${r || 'fed'}`);
     };
     if (rtcURL) {
-      os.federateRTCAuto({ url: rtcURL, room });
+      const peers = (qs.get('peers') || '').split(',').map(s => s.trim()).filter(Boolean);
+      os.federateRTCAuto(Object.assign({ url: rtcURL, room }, peers.length ? { peers } : {}));
       logEvent('MESH', `federation → WebRTC auto · relay ${rtcURL} brokers handshake only · room ${room}`);
       window.addEventListener('niceassos:fed-open', () => {
         const s = os.federation();

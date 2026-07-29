@@ -239,9 +239,18 @@ direct P2P link to every other machine (a **full mesh**, K−1 links each).
   or flood the shared ledger (bounded by its LRU); it can **never forge** an
   envelope (Ed25519). For untrusted networks, pass `opts.peers` (allow-list) or use
   a secret room name.
-- **Limitation.** Full mesh, no relay-through gossip: two machines that cannot form
-  a *direct* link (e.g. symmetric NAT without a STUN/TURN server) do not exchange,
-  even if both can reach a third.
+- **Relay-through gossip (BUILT, default on).** Two machines that cannot form a
+  *direct* link still exchange, as long as both reach a common peer: on accepting a
+  received envelope, a machine re-forwards it to its OTHER links (never back to the
+  source). The `FederationLedger` replay check + `SeenCache` stop loops, and per-link
+  `delivered` sets stop redundant sends, so an envelope reaches every reachable
+  machine and is processed once. Disable with `opts.gossip:false` (pure full mesh).
+  *Verified live: a forced partial mesh (A↔B, A↔C, no B↔C) relayed C's envelope to B
+  through A; and a deterministic sim covers relay-through, loop-freedom in a cyclic
+  mesh, no-bounce-to-source, and multi-hop line flooding.*
+- **Residual.** Gossip floods, so one envelope from a hostile flooding peer is
+  amplified by the mesh (bounded by `MAX_PEERS` + the ledger LRU, never forgeable) —
+  use `opts.peers` / a secret room on untrusted networks, or `opts.gossip:false`.
 
 Enable it: `os.federateRTCAuto({ url, room, iceServers?, peers? })`, or open
 `fallos.html?rtc=ws://host:port/&room=fed` on each machine. *Verified: three
@@ -251,8 +260,9 @@ verified (`rejected: 0`).*
 
 ## §7 · Non-goals for this build
 
-- Relay-through gossip (partial-mesh relay of a peer's envelopes) — the full mesh
-  is built; gossip would let non-directly-connectable machines still exchange.
+- A spanning-tree / ACK-based gossip that avoids the full-mesh flood's redundant
+  sends — the flooding gossip is built and correct; a smarter overlay is an
+  optimization for large meshes.
 - Remote AI tier in-browser (use the si-didy-agent cockpit).
 - Hard-blocking admission (logged, switchable).
 - The full estate app set mounted (FallMesh is the reference organ; the rest

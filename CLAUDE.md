@@ -53,8 +53,13 @@ one sovereign browser OS. See [`README.md`](./README.md) and [`SPEC.md`](./SPEC.
   every machine holds a direct link to every other (`Map<peerPub, link>`). Each
   pair negotiates independently; `politePeer` (kernel) picks the offerer. Per-link
   self-heal timeout; forward broadcasts to all open links; shared ledger/SeenCache
-  dedup. MAX_PEERS=16; full mesh (no gossip). One gateway/machine (shared Web Lock).
+  dedup. MAX_PEERS=16. One gateway/machine (shared Web Lock).
   `fallos.html?rtc=ws://host:port/&room=fed`.
+- Relay-through GOSSIP (default on, `opts.gossip:false` to disable): `meshReceive`
+  re-forwards an accepted envelope to the OTHER links (`meshBroadcast`), never back
+  to the source (per-link `delivered`). Loops stopped by the ledger replay check +
+  `SeenCache`; own-fork echoes dropped in `fedReceive` (which now RETURNS the
+  accepted env so `meshReceive` knows to gossip). Tested: `node integration/gossip.mjs`.
 - Run a relay: `node scripts/relay-server.mjs`. Federate the OS:
   `fallos.html?relay=ws://host:port/&room=fed`.
 

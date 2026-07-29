@@ -16,7 +16,7 @@
  *   os.requestAI({ prompt, tokens }, onToken);   // cascade: local-first, remote fallback
  */
 import {
-  VERSION, SIGNAL_VERSION, MeshLog, canonicalJSON, fnv1a, admit, route, cascade, ringGlyph, organEvent,
+  VERSION, SIGNAL_VERSION, MeshLog, canonicalJSON, admit, route, cascade, ringGlyph, organEvent,
   verifyEnvelope, FederationLedger, SeenCache, fingerprint, shouldFederate, validSignal, politePeer,
 } from './niceassos-kernel.mjs';
 
@@ -200,37 +200,44 @@ export async function installOS(opts = {}) {
     } catch (_) {}
   }
 
-  // the four-check receive path — identical for every carrier
+  // the four-check receive path — identical for every carrier. Returns
+  // { env, h } on a fresh accept (so a gossiping mesh can re-forward it, keyed on
+  // the SHA-256 digest) or undefined.
   async function fedReceive(data, ctx) {
     let env; try { env = JSON.parse(data); } catch (_) { return; }
+    if (env && env.fork_pub === identity.pubHex) return; // our OWN fork echoed back (gossip) → ignore
     await ctx.hydrated; // ledger loaded before we judge replay
     if (!verifyEnvelope(env, { requireSig: true, maxSkewMs: FRESHNESS_MS, now: Date.now() }).ok) { ctx.stat.rejected++; return; }
-    if (!(await verifyRemoteSig(env))) { ctx.stat.rejected++; return; }  // a carrier can't forge
     const h = await sha256hex(canonicalJSON(env));
-    if (!ctx.ledger.accept(env, h).ok) { ctx.stat.rejected++; return; }  // replay / chain break
-    if (!ctx.seen.add(h)) return;                                        // already handled → no loop
+    if (ctx.seen.has(h)) return;                                        // DUPLICATE (gossip fan-out) → drop BEFORE the costly Ed25519 verify
+    if (!(await verifyRemoteSig(env))) { ctx.stat.rejected++; return; } // a carrier can't forge (only new envelopes reach here)
+    if (!ctx.ledger.accept(env, h).ok) { ctx.stat.rejected++; return; } // replay / chain break (also stops gossip loops)
+    if (!ctx.seen.add(h)) return;                                       // race guard
     ctx.persist(); ctx.stat.recv++;
     try { mesh && mesh.postMessage(env); } catch (_) {}                  // inject onto local mesh (all tabs see it)
     envListeners.forEach(fn => { try { fn(env); } catch (_) {} });
     try { window.dispatchEvent(new CustomEvent('niceassos:fed-recv', { detail: env })); } catch (_) {}
+    return { env, h };                                                   // accepted → caller may gossip it onward, keyed on h
   }
 
   // SERIALIZE receive per context: carriers deliver envelopes in order (TCP/SCTP
   // ordered), but fedReceive is async — two close-together envelopes could
   // interleave and hit the ledger out of order, making it reject the earlier
   // (now "stale") one. Chain them so the ledger sees them in arrival order.
+  // Returns this call's result (the accepted env or undefined).
   function fedReceiveOrdered(data, ctx) {
-    ctx.recvTail = (ctx.recvTail || Promise.resolve()).then(() => fedReceive(data, ctx)).catch(() => {});
-    return ctx.recvTail;
+    const p = (ctx.recvTail || Promise.resolve()).then(() => fedReceive(data, ctx));
+    ctx.recvTail = p.catch(() => {});
+    return p;
   }
 
-  // the forward path — identical for every carrier; `send(str)→bool` is the wire
+  // the forward path — identical for every carrier; `send(str, h)→bool` is the wire
   async function fedForward(env, fromEmit, ctx, send) {
     if (!ctx.stat.connected) return;
     if (!shouldFederate(env, identity.pubHex, !!fromEmit)) return;
     const h = await sha256hex(canonicalJSON(env));
     if (ctx.seen.has(h)) return;              // came from the carrier, or already sent → don't echo
-    if (!send(JSON.stringify(env))) return;   // send failed → do NOT mark seen; stays retryable (no chain gap)
+    if (!send(JSON.stringify(env), h)) return; // send failed → do NOT mark seen; stays retryable (no chain gap)
     ctx.seen.add(h);                          // record only after a confirmed send
     ctx.stat.sent++;
     if (env.fork_pub === identity.pubHex && Number.isInteger(env.seq) && env.seq > ctx.hw.seq) { ctx.hw.seq = env.seq; ctx.persistHw(); }
@@ -416,12 +423,15 @@ export async function installOS(opts = {}) {
   const MAX_PEERS = 16;          // total links (memory bound)
   const MAX_PENDING = 6;         // half-open (negotiating) links — sybil / churn bound
   const OUTBOX_MAX = 512;        // per-link backlog bound
+  const RL_BURST = 1024;         // per-source receive token bucket: burst
+  const RL_REFILL_MS = 5;        // …refills 1 token / 5 ms → ~200/s sustained (floods shed above this)
   function connectFederationRTCAuto(opts) {
     opts = opts || {};
     const room = opts.room || 'fed';
     if (!opts.url) throw new Error('federateRTCAuto needs { url } (a relay for signaling)');
     if (fed && fed.stop) { try { fed.stop(); } catch (_) {} } // one active carrier per machine
     const allow = Array.isArray(opts.peers) ? new Set(opts.peers) : (typeof opts.peer === 'string' ? new Set([opts.peer]) : null);
+    const gossip = opts.gossip !== false; // relay-through re-forward (default ON) — reachability for partial meshes
     const sigRoom = 'rtcsig:' + room; // isolate signaling from any WS-carrier envelope room
     const wsurl = opts.url + (opts.url.includes('?') ? '&' : '?') + 'room=' + encodeURIComponent(sigRoom);
     const ctx = makeFedContext(room, { leader: false, transport: 'rtc-auto', peers: 0, connectedPeers: 0 });
@@ -469,11 +479,44 @@ export async function installOS(opts = {}) {
         else break; // congested → wait for onDrain / next flush
       }
     }
+    // enqueue an envelope to every link that has not already had it. `k` is the
+    // SHA-256 digest (same as the ledger uses — no 32-bit fnv1a collision); pre-
+    // marking a link's `delivered` excludes it (the peer a gossip came from).
+    function meshBroadcast(env, k) {
+      const s = JSON.stringify(env);
+      for (const l of links.values()) {
+        if (l.delivered.has(k)) continue;
+        if (l.outbox.length >= OUTBOX_MAX) { l.outbox.shift(); ctx.stat.dropped = (ctx.stat.dropped || 0) + 1; } // backlog full → drop-oldest, but COUNT it (not silent)
+        l.outbox.push({ s, k });
+        flushLink(l);
+      }
+    }
+    // per-source RATE LIMIT (token bucket): bounds how fast one link can drive
+    // receive+gossip, so a single authenticated peer can't flood-amplify the mesh.
+    // Generous — normal federation is far below it; only egregious floods are shed.
+    function rateOk(l) {
+      const now = Date.now();
+      l.rlTokens = Math.min(RL_BURST, (l.rlTokens == null ? RL_BURST : l.rlTokens) + (now - (l.rlLast || now)) / RL_REFILL_MS);
+      l.rlLast = now;
+      if (l.rlTokens >= 1) { l.rlTokens -= 1; return true; }
+      return false;
+    }
+    // GOSSIP (relay-through): re-forward a received envelope to the REST of the
+    // mesh, so two machines that cannot form a direct link still exchange via a
+    // common peer. The ledger's replay check + SeenCache stop loops; per-link
+    // `delivered` (+ pre-marking the source) stop sending it back.
+    async function meshReceive(data, sourceLink) {
+      if (!rateOk(sourceLink)) { ctx.stat.dropped = (ctx.stat.dropped || 0) + 1; return; } // shed a flooding source
+      const r = await fedReceiveOrdered(data, ctx); // { env, h } iff newly accepted
+      if (!r || stopped || !gossip) return;
+      try { sourceLink.delivered.add(r.h); } catch (_) {} // don't bounce it back
+      meshBroadcast(r.env, r.h);
+    }
     function wireCarrier(l) {
       l.carrier.onOpen(async () => { clearNego(l); l.connected = true; await resumeSeqAboveHighWater(ctx); refreshStats(); flushLink(l); try { window.dispatchEvent(new CustomEvent('niceassos:fed-open', { detail: { ...ctx.stat, peer: l.pub } })); } catch (_) {} });
       l.carrier.onClose(() => { if (!stopped) dropLink(l, true); }); // dropped link → tear down + re-invite
       l.carrier.onDrain(() => flushLink(l));                          // congestion cleared → drain backlog
-      l.carrier.onMessage((data) => fedReceiveOrdered(data, ctx));           // shared ctx → ledger/seen dedup across links
+      l.carrier.onMessage((data) => meshReceive(data, l));            // receive + gossip; shared ctx dedups across links
     }
     async function startOffer(l) {
       if (l.carrier) return;
@@ -532,21 +575,9 @@ export async function installOS(opts = {}) {
     } else { becomeLeader(); }
     fed = {
       status: () => ({ ...ctx.stat }),
-      // enqueue to EVERY link that hasn't already been delivered this envelope, then
-      // flush. Per-link outboxes + onOpen/onDrain flushing mean a slow or late link
-      // gets the backlog — no envelope is lost just because a faster link took it.
-      forward: (env, fromEmit) => fedForward(env, fromEmit, ctx, (s) => {
-        const k = fnv1a(s);
-        let queued = false;
-        for (const l of links.values()) {
-          if (l.delivered.has(k)) continue;
-          l.outbox.push({ s, k });
-          while (l.outbox.length > OUTBOX_MAX) l.outbox.shift(); // bound the backlog
-          flushLink(l);
-          queued = true;
-        }
-        return queued || links.size === 0; // handled → ctx.seen dedups our own re-forward
-      }),
+      // our own emits: broadcast to every link (per-link outboxes + onOpen/onDrain
+      // flushing mean a slow/late link still gets it). ctx.seen dedups re-forwards.
+      forward: (env, fromEmit) => fedForward(env, fromEmit, ctx, (s, h) => { meshBroadcast(env, h); return true; }),
       stop: () => {
         stopped = true; ctx.stat.leader = false;
         for (const l of links.values()) { clearNego(l); try { l.carrier && l.carrier.close(); } catch (_) {} }

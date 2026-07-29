@@ -121,3 +121,14 @@ distinct identities), each `?rtc=ws://localhost:17346/&room=mesh3`:
 | Envelopes flow across all links | every machine `sent`/`recv` > 0, all `rejected: 0` (four-check verified) |
 | Broadcast forwarding | `forward` sends to every open link; shared ledger/SeenCache dedup across links |
 | Bounded | `MAX_PEERS` (16) caps the mesh; `opts.peers` optional allow-list |
+
+## Relay-through gossip
+
+**Deterministic** — `node integration/gossip.mjs` (real kernel primitives, simulated topology): relay-through in a partial mesh (B↔C via A), loop-freedom in a cyclic triangle, no-bounce-to-source, and multi-hop line flooding (A→B→C→D). 4/4.
+
+**Live** — a forced partial mesh: A opened plain; B and C opened with `?peers=<A's pub>` so they link **only to A**, never each other:
+
+| Claim | Evidence |
+|---|---|
+| Partial mesh formed | A `connectedPeers: 2`; B `connectedPeers: 1` (A only) |
+| Gossip relays through A | B (no direct C link) received a **third fork** `c7cf531e88` = C's, relayed by A — `gossipProven: true` |
