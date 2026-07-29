@@ -1,0 +1,83 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://sjgant80-hub.github.io/niceassos-organs/organ.schema.json",
+  "title": "NiceAssOS L3 Organ Manifest",
+  "description": "◊·κ=φ⁴ · declarative manifest a tool ships at repo root as organ.json to declare itself as an L3 organ of NiceAssOS · niceassos-spec §2 L3 · every organ = an existing estate tool bound to a ring (R0-R6) that publishes fork_join on load and beacon every 60s.",
+  "type": "object",
+  "required": ["name", "ring", "glyph", "purpose", "publishes", "listens"],
+  "additionalProperties": true,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "URI of this schema · optional"
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{1,63}$",
+      "description": "Repo slug of the tool · lowercase kebab-case · matches sjgant80-hub/<name>"
+    },
+    "ring": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 6,
+      "description": "Ring position · 0 ground · 1 perception · 2 gate · 3 heart · 4 naming · 5 observation · 6 resolution"
+    },
+    "glyph": {
+      "type": "string",
+      "description": "Single-char ring glyph · ▓ ◉ ▲ ♡ ◈ ◯ ◊ · or organ-specific override"
+    },
+    "purpose": {
+      "type": "string",
+      "description": "One-line what-this-organ-does · framework voice"
+    },
+    "publishes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["beacon", "bloom_pulse", "fork_join", "recall_query", "recall_response", "token_share", "konomi_mint", "fall-forge:gap_claimed"]
+      },
+      "minItems": 1,
+      "description": "Envelope kinds this organ emits on niceassos-mesh"
+    },
+    "listens": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1,
+      "description": "Envelope kinds or event names this organ subscribes to · common: cassie:tick, bloom_pulse, beacon"
+    },
+    "konomi_pub_source": {
+      "type": "string",
+      "description": "Where to load the fork public key from · 'identity.pub' (default · IndexedDB niceassos-seed-v1) · 'fresh' (mint new) · '<hex>' (hardcoded)"
+    },
+    "spec_version": {
+      "type": "string",
+      "description": "niceassos-spec version this organ targets · e.g. niceassos-spec/0.2",
+      "default": "niceassos-spec/0.2"
+    },
+    "mesh_channel": {
+      "type": "string",
+      "default": "niceassos-mesh",
+      "description": "Primary BroadcastChannel name"
+    },
+    "legacy_channel": {
+      "type": "string",
+      "default": "fall-signal",
+      "description": "Legacy BroadcastChannel for si-didy estate compat"
+    },
+    "beacon_interval_ms": {
+      "type": "integer",
+      "default": 60000,
+      "minimum": 5000,
+      "description": "How often to emit a beacon · default 60s"
+    },
+    "grafted_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this organ was grafted into the L3 mesh"
+    },
+    "prime": {
+      "type": "integer",
+      "description": "Optional Konomi prime (from tool's identity)"
+    }
+  }
+}

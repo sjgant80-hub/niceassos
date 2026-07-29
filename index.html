@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>niceassos · the OG sovereign OS</title>
+<style>
+  :root { --void:#0a0e14; --surface:#111823; --border:#1e2a3a; --text:#cfe3ff;
+          --muted:#5b7a99; --cyan:#00d4ff; --gold:#d4a017; --green:#10b981; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:radial-gradient(1200px 600px at 50% -10%, #10203a 0%, var(--void) 60%);
+         color:var(--text); font:14px/1.7 ui-monospace,'JetBrains Mono',monospace;
+         min-height:100vh; display:flex; align-items:center; justify-content:center; padding:32px; }
+  main { max-width:760px; width:100%; }
+  .glyph { font-size:52px; color:var(--gold); letter-spacing:6px; }
+  h1 { font-size:34px; letter-spacing:2px; margin:8px 0 4px; }
+  .tag { color:var(--muted); margin-bottom:28px; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:22px 24px; margin:14px 0; }
+  .card h2 { font-size:13px; letter-spacing:2px; color:var(--cyan); margin-bottom:10px; text-transform:uppercase; }
+  .card p { color:var(--text); }
+  .card p + p { margin-top:8px; color:var(--muted); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:12px; }
+  .k { border-left:2px solid var(--green); padding:8px 12px; background:#0d141e; border-radius:4px; }
+  .k b { color:var(--text); } .k span { color:var(--muted); font-size:12px; display:block; }
+  .boot { display:inline-block; margin-top:22px; padding:14px 30px; background:var(--cyan); color:var(--void);
+          border-radius:7px; font-weight:700; letter-spacing:2px; text-decoration:none; }
+  .boot:hover { background:#5fe3ff; }
+  a.link { color:var(--cyan); text-decoration:none; } a.link:hover { text-decoration:underline; }
+  footer { color:var(--muted); font-size:12px; margin-top:26px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="glyph">◊</div>
+  <h1>niceassos</h1>
+  <div class="tag">the OG sovereign browser OS · κ=1 · one substrate</div>
+
+  <div class="card">
+    <h2>the merge</h2>
+    <p>The <b>fallos</b> desktop shell — a blob-iframe app sandbox with shared
+       IndexedDB — landed onto the signed <b>niceassos-mesh</b>: Ed25519
+       envelopes, SHA-256 hash-chained. Two half-operating-systems, now one.</p>
+    <p>The shell is a first-class signed node on the bus. Apps mount as signed
+       organs. The cross-app bus <em>is</em> the mesh. The brain is local-first.</p>
+  </div>
+
+  <div class="grid">
+    <div class="k"><b>proof-of-play admission</b><span>no konomify, no mount</span></div>
+    <div class="k"><b>data-driven routing</b><span>the full emits/receives graph</span></div>
+    <div class="k"><b>local-first cascade</b><span>your GPU before the cloud</span></div>
+    <div class="k"><b>pure kernel</b><span>witness 49/49 · score 1.0</span></div>
+  </div>
+
+  <div class="card">
+    <h2>read it</h2>
+    <p><a class="link" href="README.md">README</a> ·
+       <a class="link" href="SPEC.md">SPEC</a> ·
+       <a class="link" href="niceassos-kernel.mjs">kernel</a> ·
+       <a class="link" href="niceassos-bridge.js">bridge</a></p>
+  </div>
+
+  <a class="boot" href="fallos.html">▸ BOOT THE OS</a>
+
+  <footer>Architecture: Thomas Frumkin · Implementation: Simon Gant · MIT</footer>
+</main>
+</body>
+</html>

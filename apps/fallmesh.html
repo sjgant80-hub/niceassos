@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FallMesh · Bus Monitor</title>
+<style>
+  :root { --void:#0a0e14; --surface:#111823; --border:#1e2a3a; --text:#cfe3ff;
+          --muted:#5b7a99; --cyan:#00d4ff; --gold:#d4a017;
+          --green:#10b981; --amber:#f59e0b; --red:#ef4444; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--void); color:var(--text); font:12px/1.6 'JetBrains Mono',ui-monospace,monospace;
+         padding:16px; height:100vh; display:flex; flex-direction:column; gap:12px; }
+  header { display:flex; align-items:baseline; gap:12px; border-bottom:1px solid var(--border); padding-bottom:10px; }
+  h1 { font-size:14px; letter-spacing:2px; color:var(--gold); }
+  .sub { color:var(--muted); font-size:11px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  button { background:transparent; border:1px solid var(--cyan); color:var(--cyan); border-radius:5px;
+           padding:7px 14px; font:inherit; letter-spacing:1px; cursor:pointer; }
+  button:hover { background:var(--cyan); color:var(--void); }
+  .stat { color:var(--muted); }
+  .stat b { color:var(--text); font-variant-numeric:tabular-nums; }
+  #feed { flex:1; overflow-y:auto; border:1px solid var(--border); border-radius:6px; background:var(--surface);
+          padding:10px; display:flex; flex-direction:column; gap:4px; }
+  .env { display:grid; grid-template-columns:70px 1fr auto; gap:10px; align-items:baseline;
+         padding:5px 8px; border-radius:4px; background:#0d141e; border-left:2px solid var(--border); }
+  .env .k { color:var(--cyan); }
+  .env .p { color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .env .m { color:var(--muted); font-size:10px; }
+  .env.sig { border-left-color:var(--green); }
+  .env.unsig { border-left-color:var(--amber); }
+  .env.mine { border-left-color:var(--gold); }
+  .badge { color:var(--green); }
+  .badge.no { color:var(--amber); }
+  .empty { color:var(--muted); text-align:center; padding:30px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>◊ FALLMESH</h1>
+    <span class="sub">live niceassos-mesh bus monitor · every signed envelope, as it flies</span>
+  </header>
+  <div class="row">
+    <button id="ping">Emit test bloom_pulse</button>
+    <button id="clear">Clear</button>
+    <span class="stat">seen <b id="n">0</b></span>
+    <span class="stat">signed <b id="s">0</b></span>
+    <span class="stat">kinds <b id="k">0</b></span>
+    <span class="stat" id="who">identity: —</span>
+  </div>
+  <div id="feed"><div class="empty">listening on niceassos-mesh… launch other organs or click "Emit test" to see traffic</div></div>
+
+<script>
+(function () {
+  'use strict';
+  const feed = document.getElementById('feed');
+  const kinds = new Set();
+  let n = 0, s = 0, mine = null, cleared = true;
+
+  // Connect directly to the signed bus (same channel the kernel/bridge uses)
+  let ch = null;
+  try { ch = new BroadcastChannel('niceassos-mesh'); } catch (_) {}
+
+  function render(env, isMine) {
+    if (cleared) { feed.innerHTML = ''; cleared = false; }
+    n++;
+    const signed = !!env.signature;
+    if (signed) s++;
+    kinds.add(env.kind);
+    document.getElementById('n').textContent = n;
+    document.getElementById('s').textContent = s;
+    document.getElementById('k').textContent = kinds.size;
+    const el = document.createElement('div');
+    el.className = 'env ' + (isMine ? 'mine' : signed ? 'sig' : 'unsig');
+    const pub = (env.fork_pub || '????????').slice(0, 8);
+    const payload = JSON.stringify(env.payload || {}).slice(0, 90);
+    el.innerHTML = `<span class="k">${env.kind || '?'}</span>`
+      + `<span class="p">seq ${env.seq ?? '?'} · ${pub}… · ${payload}</span>`
+      + `<span class="m"><span class="badge ${signed ? '' : 'no'}">${signed ? '✓sig' : '·unsig'}</span></span>`;
+    feed.insertBefore(el, feed.firstChild);
+    while (feed.children.length > 200) feed.removeChild(feed.lastChild);
+  }
+
+  ch && (ch.onmessage = (ev) => render(ev.data || {}, mine && ev.data && ev.data.fork_pub === mine));
+
+  // Learn our own OS identity (so we can tag our own echoes) once the bridge is up
+  window.addEventListener('niceassos:sent', (e) => { if (!mine && e.detail) { mine = e.detail.fork_pub; document.getElementById('who').textContent = 'identity: ' + (mine || '—').slice(0, 10) + '…'; } });
+
+  // Emit a test pulse straight onto the bus (unsigned from here — proves receive path;
+  // signed traffic comes from the kernel/bridge and other grafted organs)
+  document.getElementById('ping').onclick = () => {
+    const env = { version: 'niceassos-mesh-v1', kind: 'bloom_pulse', fork_pub: 'fallmesh-monitor',
+                  ts: new Date().toISOString(), seq: n, prev_hash: null,
+                  payload: { intensity: 0.6, color: '◊', organ: 'fallmesh' }, signature: null };
+    try { ch && ch.postMessage(env); } catch (_) {}
+    render(env, false);
+    // also let the OS know, via the injected bridge, if present
+    try { window.fallOS && window.fallOS.send('mesh.ping', { organ: 'fallmesh' }); } catch (_) {}
+  };
+  document.getElementById('clear').onclick = () => { feed.innerHTML = '<div class="empty">cleared</div>'; cleared = true; n = 0; s = 0; kinds.clear(); document.getElementById('n').textContent = 0; document.getElementById('s').textContent = 0; document.getElementById('k').textContent = 0; };
+
+  // Announce ready to the OS shell if mounted inside fallos
+  try { window.fallOS && window.fallOS.send('mesh.ready', {}); } catch (_) {}
+})();
+</script>
+</body>
+</html>
