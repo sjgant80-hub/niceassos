@@ -1818,7 +1818,7 @@ async function initMesh() {
       logEvent('MESH', `federation → WebRTC auto · relay ${rtcURL} brokers handshake only · room ${room}`);
       window.addEventListener('niceassos:fed-open', () => {
         const s = os.federation();
-        logEvent('MESH', `federation OPEN · P2P data channel (${s.role}) · relay-free data path`);
+        logEvent('MESH', `federation OPEN · P2P mesh · ${s.connectedPeers}/${s.peers} peer(s) connected · relay-free data`);
       });
       window.addEventListener('niceassos:fed-recv', (e) => {
         const s = os.federation();

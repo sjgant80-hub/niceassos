@@ -108,3 +108,16 @@ with `?rtc=ws://localhost:17346/&room=autotest`:
 | Envelopes flow P2P, verified | A `sent:1/recv:1`, B `sent:2/recv:2`, both `rejected:0` |
 | Relay-free data path | envelopes go `carrier.send` (data channel); the signaling socket carries only `hello`/`offer`/`answer` |
 | hello signal validated | `validSignal` unit-tested for the `hello` type (no sdp required; bad from/room rejected) |
+
+## N-peer full mesh
+
+**Three** different-origin tabs (`localhost`, `127.0.0.1`, `127.0.0.2` → three
+distinct identities), each `?rtc=ws://localhost:17346/&room=mesh3`:
+
+| Claim | Evidence |
+|---|---|
+| Full mesh auto-forms | all three machines reached `connectedPeers: 2` (each linked to the other two — 3 pairwise links) |
+| Distinct identities | pubs `d74b4b42`, `8f168eb6`, `1684bc89`; relay showed 3 signaling connections |
+| Envelopes flow across all links | every machine `sent`/`recv` > 0, all `rejected: 0` (four-check verified) |
+| Broadcast forwarding | `forward` sends to every open link; shared ledger/SeenCache dedup across links |
+| Bounded | `MAX_PEERS` (16) caps the mesh; `opts.peers` optional allow-list |

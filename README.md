@@ -106,16 +106,17 @@ Same four-check verification, same coherence guarantees — only the wire differ
 See [`SPEC.md`](./SPEC.md) §6b.
 
 **Turnkey WebRTC** with **auto-signaling** — the relay brokers only the handshake,
-then the data path is peer-to-peer. Point both machines at the same relay+room and
-they discover each other, negotiate, and connect automatically:
+then the data path is peer-to-peer. Point every machine at the same relay+room and
+they discover each other and form a **full mesh** (N machines, each linked to every
+other) automatically:
 
 ```js
 os.federateRTCAuto({ url: 'ws://host:port/', room: 'fed' });
 // or open fallos.html?rtc=ws://host:port/&room=fed on each machine
 ```
 
-`politePeer` (pure kernel) splits the roles so there's never a glare collision;
-the relay never touches envelope data. See [`SPEC.md`](./SPEC.md) §6c.
+`politePeer` (pure kernel) splits the role for each pair so there's never a glare
+collision; the relay never touches envelope data. See [`SPEC.md`](./SPEC.md) §6c.
 
 ## What's real vs what's next
 
@@ -124,9 +125,9 @@ data-driven routing, proof-of-play admission, the cascade tiering, the
 launch→signed-`fork_join` loop, and **cross-machine federation** (relay carrier +
 sign/chain/replay verification on receipt).
 
-**Next:** an N-peer WebRTC mesh (a carrier per peer — the 2-machine link is done);
-the full estate app set mounted as gated organs; the remote AI tier wired
-in-browser (today it's the si-didy-agent cockpit).
+**Next:** relay-through gossip (so machines that can't form a *direct* WebRTC link
+still exchange through a common peer); the full estate app set mounted as gated
+organs; the remote AI tier wired in-browser (today it's the si-didy-agent cockpit).
 
 ## License
 

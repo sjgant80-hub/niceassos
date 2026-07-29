@@ -16,7 +16,7 @@
  *   os.requestAI({ prompt, tokens }, onToken);   // cascade: local-first, remote fallback
  */
 import {
-  VERSION, SIGNAL_VERSION, MeshLog, canonicalJSON, admit, route, cascade, ringGlyph, organEvent,
+  VERSION, SIGNAL_VERSION, MeshLog, canonicalJSON, fnv1a, admit, route, cascade, ringGlyph, organEvent,
   verifyEnvelope, FederationLedger, SeenCache, fingerprint, shouldFederate, validSignal, politePeer,
 } from './niceassos-kernel.mjs';
 
@@ -215,6 +215,15 @@ export async function installOS(opts = {}) {
     try { window.dispatchEvent(new CustomEvent('niceassos:fed-recv', { detail: env })); } catch (_) {}
   }
 
+  // SERIALIZE receive per context: carriers deliver envelopes in order (TCP/SCTP
+  // ordered), but fedReceive is async — two close-together envelopes could
+  // interleave and hit the ledger out of order, making it reject the earlier
+  // (now "stale") one. Chain them so the ledger sees them in arrival order.
+  function fedReceiveOrdered(data, ctx) {
+    ctx.recvTail = (ctx.recvTail || Promise.resolve()).then(() => fedReceive(data, ctx)).catch(() => {});
+    return ctx.recvTail;
+  }
+
   // the forward path — identical for every carrier; `send(str)→bool` is the wire
   async function fedForward(env, fromEmit, ctx, send) {
     if (!ctx.stat.connected) return;
@@ -240,7 +249,7 @@ export async function installOS(opts = {}) {
       ws.onopen = () => { ctx.stat.connected = true; try { window.dispatchEvent(new CustomEvent('niceassos:fed-open', { detail: { ...ctx.stat } })); } catch (_) {} };
       ws.onclose = () => { ctx.stat.connected = false; if (ctx.stat.leader && fed) setTimeout(() => { if (ctx.stat.leader && fed) openSocket(); }, 2000); };
       ws.onerror = () => { ctx.stat.connected = false; };
-      ws.onmessage = (ev) => fedReceive(ev.data, ctx);
+      ws.onmessage = (ev) => fedReceiveOrdered(ev.data, ctx);
     }
     async function becomeLeader() {
       ctx.stat.leader = true;
@@ -305,14 +314,16 @@ export async function installOS(opts = {}) {
   // external dependency.
   const RTC_BACKPRESSURE = 4 << 20; // 4 MiB buffered → treat send as failed (retryable)
   function makeRTCCarrier({ iceServers, room }) {
-    const openCbs = [], closeCbs = [], msgCbs = [];
+    const openCbs = [], closeCbs = [], msgCbs = [], drainCbs = [];
     const pc = new RTCPeerConnection({ iceServers: iceServers || [] });
     let dc = null;
     function wire(channel) {
       dc = channel;
+      try { dc.bufferedAmountLowThreshold = RTC_BACKPRESSURE >> 1; } catch (_) {}
       dc.onopen = () => openCbs.forEach(f => { try { f(); } catch (_) {} });
       dc.onclose = () => closeCbs.forEach(f => { try { f(); } catch (_) {} });
       dc.onmessage = (e) => msgCbs.forEach(f => { try { f(e.data); } catch (_) {} });
+      dc.onbufferedamountlow = () => drainCbs.forEach(f => { try { f(); } catch (_) {} }); // congestion cleared → flush queues
     }
     pc.ondatachannel = (e) => wire(e.channel); // the answerer receives the channel
     // wait for ICE gathering to finish (or a 3s cap) — with full listener/timer cleanup
@@ -329,7 +340,7 @@ export async function installOS(opts = {}) {
     }
     return {
       kind: 'rtc',
-      onOpen: (f) => openCbs.push(f), onClose: (f) => closeCbs.push(f), onMessage: (f) => msgCbs.push(f),
+      onOpen: (f) => openCbs.push(f), onClose: (f) => closeCbs.push(f), onMessage: (f) => msgCbs.push(f), onDrain: (f) => drainCbs.push(f),
       // backpressure: if the channel is congested, report a (retryable) failure
       // instead of dropping — fedForward won't mark it seen, so it isn't lost.
       send: (s) => { try { if (dc && dc.readyState === 'open' && dc.bufferedAmount < RTC_BACKPRESSURE) { dc.send(s); return true; } } catch (_) {} return false; },
@@ -374,7 +385,7 @@ export async function installOS(opts = {}) {
       try { window.dispatchEvent(new CustomEvent('niceassos:fed-open', { detail: { ...ctx.stat } })); } catch (_) {}
     });
     carrier.onClose(() => { ctx.stat.connected = false; });
-    carrier.onMessage((data) => fedReceive(data, ctx));
+    carrier.onMessage((data) => fedReceiveOrdered(data, ctx));
     fed = {
       status: () => ({ ...ctx.stat }),
       forward: (env, fromEmit) => fedForward(env, fromEmit, ctx, carrier.send),
@@ -390,28 +401,33 @@ export async function installOS(opts = {}) {
     return fed;
   }
 
-  // ── carrier 3: WebRTC AUTO-signaling — the relay brokers ONLY the handshake ──
-  // Both machines connect to a signaling-only relay room, discover each other via
-  // signed `hello`, and politePeer picks exactly one offerer. Signed offer/answer
-  // flow through the relay; once the data channel opens, envelopes go peer-to-peer
-  // and the relay never touches envelope data. Web Locks elects one gateway tab
-  // per machine. The handshake SELF-HEALS: a lost frame or a failed/closed channel
-  // trips a negotiation timeout that tears down and re-announces, and the peer
-  // binding is tentative (freed on timeout) so a silent/hostile peer that grabs
-  // the slot cannot permanently lock out the real machine. opts.peer pins an
-  // expected peer fork_pub (a hard allow-list). Scope: one peer per link.
-  const SIGNAL_SKEW_MS = 60000; // reject signals whose ts is >1 min off (replay defense)
+  // ── carrier 3: WebRTC AUTO-signaling — N-PEER FULL MESH ──────────────────────
+  // Every machine in the signaling room holds a direct WebRTC link to every other
+  // machine (K machines → K−1 links each). The relay brokers ONLY the handshake;
+  // envelopes go peer-to-peer over the mesh. Discovery: signed `hello`; each PAIR
+  // negotiates independently and politePeer picks that pair's offerer. Each link
+  // self-heals (per-link negotiation timeout tears down + re-announces). Forwarding
+  // broadcasts to every open link; the shared FederationLedger/SeenCache dedup
+  // across links. Web Locks elects one gateway tab per machine. opts.peers (array)
+  // pins an allow-list; MAX_PEERS bounds the mesh. Note: FULL mesh (no relay-through
+  // gossip) — two machines that cannot form a direct link do not exchange.
+  const SIGNAL_SKEW_MS = 60000;  // reject signals whose ts is >1 min off (replay defense)
   const NEGO_TIMEOUT_MS = 12000; // no open data channel within this → tear down + restart
+  const MAX_PEERS = 16;          // total links (memory bound)
+  const MAX_PENDING = 6;         // half-open (negotiating) links — sybil / churn bound
+  const OUTBOX_MAX = 512;        // per-link backlog bound
   function connectFederationRTCAuto(opts) {
     opts = opts || {};
     const room = opts.room || 'fed';
     if (!opts.url) throw new Error('federateRTCAuto needs { url } (a relay for signaling)');
     if (fed && fed.stop) { try { fed.stop(); } catch (_) {} } // one active carrier per machine
-    const expectPeer = typeof opts.peer === 'string' ? opts.peer : null;
+    const allow = Array.isArray(opts.peers) ? new Set(opts.peers) : (typeof opts.peer === 'string' ? new Set([opts.peer]) : null);
     const sigRoom = 'rtcsig:' + room; // isolate signaling from any WS-carrier envelope room
     const wsurl = opts.url + (opts.url.includes('?') ? '&' : '?') + 'room=' + encodeURIComponent(sigRoom);
-    const ctx = makeFedContext(room, { leader: false, transport: 'rtc-auto', role: null, peer: null });
-    let sigWs = null, carrier = null, releaseLock = null, peer = null, negoTimer = null, stopped = false;
+    const ctx = makeFedContext(room, { leader: false, transport: 'rtc-auto', peers: 0, connectedPeers: 0 });
+    const links = new Map(); // peerPub -> { pub, carrier, role, negoTimer, connected, outbox[], delivered }
+    const sigSeen = new SeenCache(2048); // signal-level replay cache (within the freshness window)
+    let sigWs = null, releaseLock = null, stopped = false;
 
     function sigSend(obj) { try { if (sigWs && sigWs.readyState === 1) sigWs.send(JSON.stringify(obj)); } catch (_) {} }
     async function hello(to) {
@@ -419,65 +435,92 @@ export async function installOS(opts = {}) {
       if (to) h.to = to;
       sigSend(await signSignal(h));
     }
-    function clearNego() { if (negoTimer) { clearTimeout(negoTimer); negoTimer = null; } }
-    // tear down a stalled/closed link and re-open the slot for (re)discovery
-    function resetLink(reannounce) {
-      clearNego();
-      try { carrier && carrier.close(); } catch (_) {}
-      carrier = null; peer = null; ctx.stat.peer = null; ctx.stat.role = null; ctx.stat.connected = false;
-      if (reannounce && !stopped) hello();
+    function pendingCount() { let n = 0; for (const l of links.values()) if (!l.connected) n++; return n; }
+    // reject a NEW peer if the total or half-open budget is exhausted (sybil bound)
+    function overBudget(from) { return !links.has(from) && (links.size >= MAX_PEERS || pendingCount() >= MAX_PENDING); }
+    function refreshStats() {
+      ctx.stat.peers = links.size;
+      ctx.stat.connectedPeers = [...links.values()].filter(l => l.connected).length;
+      ctx.stat.connected = ctx.stat.connectedPeers > 0;
     }
-    function armNegoTimeout() {
-      clearNego();
-      negoTimer = setTimeout(() => { if (!stopped && (!carrier || !carrier.isOpen())) resetLink(true); }, NEGO_TIMEOUT_MS);
+    function link(pub) {
+      let l = links.get(pub);
+      if (!l) { l = { pub, carrier: null, role: null, negoTimer: null, connected: false, outbox: [], delivered: new SeenCache(4096) }; links.set(pub, l); refreshStats(); }
+      return l;
     }
-    function wireCarrier() {
-      carrier.onOpen(async () => { clearNego(); await resumeSeqAboveHighWater(ctx); ctx.stat.connected = true; try { window.dispatchEvent(new CustomEvent('niceassos:fed-open', { detail: { ...ctx.stat } })); } catch (_) {} });
-      carrier.onClose(() => { if (!stopped) resetLink(true); }); // dropped channel → restart handshake
-      carrier.onMessage((data) => fedReceive(data, ctx));
+    function clearNego(l) { if (l.negoTimer) { clearTimeout(l.negoTimer); l.negoTimer = null; } }
+    function dropLink(l, reannounce) {
+      clearNego(l);
+      try { l.carrier && l.carrier.close(); } catch (_) {}
+      links.delete(l.pub); refreshStats();
+      if (reannounce && !stopped) hello(l.pub); // DIRECTIONAL re-invite (not a room-wide broadcast)
     }
-    async function startOffer(peerPub) {
-      if (carrier) return;
-      peer = peerPub; ctx.stat.peer = peerPub; ctx.stat.role = 'offerer';
-      carrier = makeRTCCarrier({ iceServers: opts.iceServers, room });
-      wireCarrier();
-      armNegoTimeout(); // if no answer / no channel in time → resetLink + re-hello
-      const offer = await carrier.createOffer(identity.pubHex, { to: peerPub, ts: Date.now() });
+    function armNego(l) {
+      clearNego(l);
+      l.negoTimer = setTimeout(() => { if (!stopped && (!l.carrier || !l.carrier.isOpen())) dropLink(l, true); }, NEGO_TIMEOUT_MS);
+    }
+    // PER-LINK delivery: each link drains its own outbox, so a slow/late/congested
+    // link never loses an envelope a faster link already got (the N-peer fix).
+    function flushLink(l) {
+      if (!l.carrier || !l.carrier.isOpen()) return;
+      while (l.outbox.length) {
+        const item = l.outbox[0];
+        if (l.carrier.send(item.s)) { l.outbox.shift(); l.delivered.add(item.k); }
+        else break; // congested → wait for onDrain / next flush
+      }
+    }
+    function wireCarrier(l) {
+      l.carrier.onOpen(async () => { clearNego(l); l.connected = true; await resumeSeqAboveHighWater(ctx); refreshStats(); flushLink(l); try { window.dispatchEvent(new CustomEvent('niceassos:fed-open', { detail: { ...ctx.stat, peer: l.pub } })); } catch (_) {} });
+      l.carrier.onClose(() => { if (!stopped) dropLink(l, true); }); // dropped link → tear down + re-invite
+      l.carrier.onDrain(() => flushLink(l));                          // congestion cleared → drain backlog
+      l.carrier.onMessage((data) => fedReceiveOrdered(data, ctx));           // shared ctx → ledger/seen dedup across links
+    }
+    async function startOffer(l) {
+      if (l.carrier) return;
+      l.role = 'offerer';
+      l.carrier = makeRTCCarrier({ iceServers: opts.iceServers, room });
+      wireCarrier(l); armNego(l);
+      const offer = await l.carrier.createOffer(identity.pubHex, { to: l.pub, ts: Date.now() });
       sigSend(offer);
     }
     async function onSignal(msg) {
       if (!validSignal(msg).ok) return;
       if (msg.from === identity.pubHex) return;         // our own echo (or same-identity tab)
-      if (msg.to && msg.to !== identity.pubHex) return; // directed elsewhere
-      if (expectPeer && msg.from !== expectPeer) return;// allow-list: only the expected peer
-      if (peer && msg.from !== peer) return;            // one peer per link (2-machine scope)
+      if (msg.to && msg.to !== identity.pubHex) return; // directed at another peer
+      if (allow && !allow.has(msg.from)) return;        // allow-list (opts.peers)
       if (!(await verifySignalSig(msg, { maxSkewMs: SIGNAL_SKEW_MS }))) return; // tampered / unsigned / stale
+      if (typeof msg.sig === 'string' && !sigSeen.add(msg.sig)) return; // exact replay of a signed signal → drop
       if (msg.type === 'hello') {
-        if (!peer) await hello(msg.from);               // reply so a late-joiner learns us
-        // impolite peer offers; polite peer records the peer and waits for the offer
-        if (!politePeer(identity.pubHex, msg.from)) { if (!carrier) await startOffer(msg.from); }
-        else if (!peer) { peer = msg.from; ctx.stat.peer = msg.from; armNegoTimeout(); } // wait for offer, bounded
+        const existing = links.get(msg.from);
+        if (existing && existing.carrier) return;       // already negotiating/connected with this peer
+        if (overBudget(msg.from)) return;               // sybil / capacity bound (re-checked post-verify)
+        await hello(msg.from);                          // reply so this peer learns us
+        const l = link(msg.from);
+        if (!politePeer(identity.pubHex, msg.from)) await startOffer(l); // impolite → we offer
+        else armNego(l);                                // polite → wait for their offer, but bounded
         return;
       }
       if (msg.type === 'offer') {
-        if (carrier && carrier.isOpen()) return;        // already connected → ignore new offers
-        if (carrier) resetLink(false);                  // stalled prior attempt → rebuild for this offer
-        peer = msg.from; ctx.stat.peer = msg.from; ctx.stat.role = 'answerer';
-        carrier = makeRTCCarrier({ iceServers: opts.iceServers, room });
-        wireCarrier();
-        armNegoTimeout();
-        const answer = await carrier.acceptOffer(msg, identity.pubHex, { to: msg.from, ts: Date.now() }, { maxSkewMs: SIGNAL_SKEW_MS });
+        if (overBudget(msg.from)) return;
+        const l = link(msg.from);
+        if (l.carrier && l.carrier.isOpen()) return;    // already connected with this peer
+        if (l.carrier) { clearNego(l); try { l.carrier.close(); } catch (_) {} l.carrier = null; } // rebuild for this offer
+        l.role = 'answerer';
+        l.carrier = makeRTCCarrier({ iceServers: opts.iceServers, room });
+        wireCarrier(l); armNego(l);
+        const answer = await l.carrier.acceptOffer(msg, identity.pubHex, { to: msg.from, ts: Date.now() }, { maxSkewMs: SIGNAL_SKEW_MS });
         sigSend(answer);
         return;
       }
       if (msg.type === 'answer') {
-        if (!carrier || ctx.stat.role !== 'offerer') return;
-        try { await carrier.acceptAnswer(msg, { maxSkewMs: SIGNAL_SKEW_MS }); } catch (_) {}
+        const l = links.get(msg.from);
+        if (!l || !l.carrier || l.role !== 'offerer') return;
+        try { await l.carrier.acceptAnswer(msg, { maxSkewMs: SIGNAL_SKEW_MS }); } catch (_) {}
       }
     }
     function openSignaling() {
       try { sigWs = new WebSocket(wsurl); } catch (_) { return; }
-      sigWs.onopen = () => { hello(); };                // announce presence
+      sigWs.onopen = () => { hello(); };                // announce presence to the whole room (once)
       sigWs.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch (_) { return; } if (m && m.v === SIGNAL_VERSION) onSignal(m); };
       sigWs.onclose = () => { if (!stopped && ctx.stat.leader && fed) setTimeout(() => { if (!stopped && ctx.stat.leader && fed) openSignaling(); }, 2000); };
       sigWs.onerror = () => {};
@@ -489,11 +532,26 @@ export async function installOS(opts = {}) {
     } else { becomeLeader(); }
     fed = {
       status: () => ({ ...ctx.stat }),
-      forward: (env, fromEmit) => fedForward(env, fromEmit, ctx, (s) => (carrier ? carrier.send(s) : false)),
+      // enqueue to EVERY link that hasn't already been delivered this envelope, then
+      // flush. Per-link outboxes + onOpen/onDrain flushing mean a slow or late link
+      // gets the backlog — no envelope is lost just because a faster link took it.
+      forward: (env, fromEmit) => fedForward(env, fromEmit, ctx, (s) => {
+        const k = fnv1a(s);
+        let queued = false;
+        for (const l of links.values()) {
+          if (l.delivered.has(k)) continue;
+          l.outbox.push({ s, k });
+          while (l.outbox.length > OUTBOX_MAX) l.outbox.shift(); // bound the backlog
+          flushLink(l);
+          queued = true;
+        }
+        return queued || links.size === 0; // handled → ctx.seen dedups our own re-forward
+      }),
       stop: () => {
-        stopped = true; ctx.stat.leader = false; clearNego();
+        stopped = true; ctx.stat.leader = false;
+        for (const l of links.values()) { clearNego(l); try { l.carrier && l.carrier.close(); } catch (_) {} }
+        links.clear();
         try { sigWs && sigWs.close(); } catch (_) {}
-        try { carrier && carrier.close(); } catch (_) {}
         if (releaseLock) { try { releaseLock(); } catch (_) {} releaseLock = null; }
         fed = null;
       },

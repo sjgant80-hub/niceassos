@@ -203,37 +203,56 @@ via copy-paste signaling; envelopes flowed bidirectionally, all four-check
 verified (`rejected: 0`), with the relay at **0 connections** — genuinely
 relay-free.*
 
-## §6c · WebRTC auto-signaling — relay brokers only the handshake (BUILT)
+## §6c · WebRTC auto-signaling — N-PEER full mesh (BUILT)
 
-`connectFederationRTCAuto` makes the WebRTC carrier turnkey: instead of
-copy-pasting blobs, the relay carries the handshake, then the data path is P2P.
+`connectFederationRTCAuto` makes the WebRTC carrier turnkey and scales to K
+machines: the relay brokers only the handshakes, then every machine holds a
+direct P2P link to every other machine (a **full mesh**, K−1 links each).
 
-- **Discovery.** Both machines connect to a signaling-only relay room
-  (`rtcsig:<room>`) and announce a signed `hello`. On seeing an unknown peer a
-  node replies with its own `hello`, so join order doesn't matter.
-- **Role split (no glare).** `politePeer(self, peer)` (pure kernel) is total and
-  antisymmetric, so of any two distinct forks exactly one is *impolite* — and only
-  the impolite peer offers. The polite peer waits and answers. No offer collision.
-- **Signed handshake.** `hello`/`offer`/`answer` are Ed25519-signed and verified
-  (`validSignal` + `verifySignalSig`) before touching `RTCPeerConnection`.
-- **Relay-free data path.** Envelopes are sent over the data channel
-  (`carrier.send`); the signaling socket only ever carries handshake messages. The
-  relay never sees an envelope.
-- **One gateway per machine.** Shares the WS carrier's Web Lock
-  (`niceassos-fed:<room>`) — one tab per machine owns the P2P link.
-- **Scope.** One peer per link (2-machine). A second distinct peer's `hello` is
-  dropped; a full N-peer mesh (a carrier per peer) is future work.
+- **Discovery.** Every machine joins a signaling-only relay room (`rtcsig:<room>`)
+  and announces a signed `hello`. Seeing an unknown peer, a node replies with its
+  own `hello`, so the mesh fills in regardless of join order — a late joiner is
+  discovered by, and discovers, every existing member.
+- **Per-pair role split (no glare).** Each pair negotiates independently; for any
+  pair `politePeer(self, peer)` (pure kernel, total + antisymmetric) makes exactly
+  one side the offerer. No offer collision, across the whole mesh.
+- **Per-link state.** A `Map<peerPub, link>` holds one carrier + role + self-heal
+  timer per peer. A dropped or failed link tears down and re-announces on its own,
+  independent of the other links.
+- **Broadcast forwarding.** An envelope is sent to every open link; the single
+  shared `FederationLedger` + `SeenCache` dedup across links (an envelope arriving
+  from two peers is processed once).
+- **Signed handshake, relay-free data.** `hello`/`offer`/`answer` are Ed25519-
+  signed (`to`+`ts` in the signed body) and verified before touching
+  `RTCPeerConnection`; envelopes go over the data channels, never the relay.
+- **Per-link delivery.** Each link has its own outbox + delivered-set; an envelope
+  is queued to every link and flushed on open / `bufferedamountlow`, so a slow,
+  congested, or late-joining link never loses an envelope a faster link already
+  took. Receive is serialized per context so the ledger sees envelopes in order.
+- **Self-heal + bounds.** Per-link 12s negotiation timeout tears down and
+  re-invites (directional); a dropped connected link recovers via WebRTC's own
+  connection-state detection. `MAX_PEERS` (16) + `MAX_PENDING` (6 half-open) bound
+  the mesh; signals carry a replay cache. Shares the WS carrier's Web Lock — one
+  gateway tab per machine.
+- **Trust model.** The relay room is the admission boundary. On an *untrusted*
+  relay, a room member can Sybil-churn half-open slots (bounded by `MAX_PENDING`)
+  or flood the shared ledger (bounded by its LRU); it can **never forge** an
+  envelope (Ed25519). For untrusted networks, pass `opts.peers` (allow-list) or use
+  a secret room name.
+- **Limitation.** Full mesh, no relay-through gossip: two machines that cannot form
+  a *direct* link (e.g. symmetric NAT without a STUN/TURN server) do not exchange,
+  even if both can reach a third.
 
-Enable it: `os.federateRTCAuto({ url, room, iceServers? })`, or open
-`fallos.html?rtc=ws://host:port/&room=fed` on each machine. *Verified: two
-different-origin tabs (distinct identities, no shared BroadcastChannel)
-auto-discovered, `politePeer` split the roles (offerer/answerer), a P2P channel
-opened through the relay, and envelopes flowed bidirectionally, all four-check
+Enable it: `os.federateRTCAuto({ url, room, iceServers?, peers? })`, or open
+`fallos.html?rtc=ws://host:port/&room=fed` on each machine. *Verified: three
+different-origin tabs (distinct identities) auto-formed a full mesh — each machine
+`connectedPeers: 2` — and envelopes flowed across all links, all four-check
 verified (`rejected: 0`).*
 
 ## §7 · Non-goals for this build
 
-- N-peer WebRTC mesh (a carrier per peer) — the 2-machine link is built.
+- Relay-through gossip (partial-mesh relay of a peer's envelopes) — the full mesh
+  is built; gossip would let non-directly-connectable machines still exchange.
 - Remote AI tier in-browser (use the si-didy-agent cockpit).
 - Hard-blocking admission (logged, switchable).
 - The full estate app set mounted (FallMesh is the reference organ; the rest

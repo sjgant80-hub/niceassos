@@ -60,15 +60,19 @@ test('two boxes federate over the untrusted relay', async () => {
   const rejectedByB = [];
   const wsA = await connect(base);
   const wsB = await connect(base);
-  wsB.onmessage = async (ev) => {
-    const env = JSON.parse(ev.data);
-    if (!verifyEnvelope(env, { requireSig: true }).ok) return rejectedByB.push('structure');
-    if (!(await verifyRemoteSig(env))) return rejectedByB.push('forged-sig');
+  // serialize receive (mirrors the bridge's fedReceiveOrdered): the two async
+  // checks must run in arrival order or the ledger sees seq out of order.
+  let recvTail = Promise.resolve();
+  const receiveB = async (data) => {
+    const env = JSON.parse(data);
+    if (!verifyEnvelope(env, { requireSig: true }).ok) return void rejectedByB.push('structure');
+    if (!(await verifyRemoteSig(env))) return void rejectedByB.push('forged-sig');
     const h = await sha256hex(canonicalJSON(env));
     const r = ledgerB.accept(env, h);
-    if (!r.ok) return rejectedByB.push(r.reason);
+    if (!r.ok) return void rejectedByB.push(r.reason);
     acceptedByB.push(env);
   };
+  wsB.onmessage = (ev) => { recvTail = recvTail.then(() => receiveB(ev.data)).catch(() => {}); };
   await wait(150); // let both joins settle
 
   try {
