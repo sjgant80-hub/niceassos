@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   VERSION, KAPPA, KINDS, canonicalJSON, fnv1a, envelope, MeshLog,
   admit, ringGlyph, route, organEvent, cascade,
+  verifyEnvelope, FederationLedger, SeenCache, fingerprint,
 } from '../niceassos-kernel.mjs';
 
 test('KAPPA is (√5−1)/2 ≈ 0.618, not φ', () => {
@@ -220,4 +221,161 @@ test('cascade: nothing available → none', () => {
 test('cascade: 8000 tokens is the boundary — not heavy', () => {
   assert.equal(cascade({ tokens: 8000 }, { local: true, remote: true }).tier, 'local');
   assert.equal(cascade({ tokens: 8001 }, { local: true, remote: true }).tier, 'remote');
+});
+
+// ─── federation: verifyEnvelope ─────────────────────────────────────────────
+const SIG = 'b'.repeat(128);
+const signedEnv = (over = {}) => ({
+  version: VERSION, kind: 'beacon', fork_pub: 'c'.repeat(64), ts: TS,
+  seq: 0, prev_hash: null, payload: {}, signature: SIG, ...over,
+});
+
+test('verifyEnvelope accepts a well-formed signed envelope', () => {
+  assert.equal(verifyEnvelope(signedEnv()).ok, true);
+});
+test('verifyEnvelope rejects a null / non-object', () => {
+  assert.equal(verifyEnvelope(null).ok, false);
+  assert.equal(verifyEnvelope(42).ok, false);
+});
+test('verifyEnvelope rejects a wrong version', () => {
+  const r = verifyEnvelope(signedEnv({ version: 'nope-v9' }));
+  assert.equal(r.ok, false); assert.match(r.reason, /version/);
+});
+test('verifyEnvelope rejects an unknown kind', () => {
+  assert.equal(verifyEnvelope(signedEnv({ kind: 'made_up' })).ok, false);
+});
+test('verifyEnvelope rejects a non-64-hex fork_pub', () => {
+  assert.equal(verifyEnvelope(signedEnv({ fork_pub: 'xyz' })).ok, false);
+  assert.equal(verifyEnvelope(signedEnv({ fork_pub: 'c'.repeat(63) })).ok, false); // one short
+});
+test('verifyEnvelope rejects missing ts and bad seq', () => {
+  assert.equal(verifyEnvelope(signedEnv({ ts: '' })).ok, false);
+  assert.equal(verifyEnvelope(signedEnv({ seq: -1 })).ok, false);
+  assert.equal(verifyEnvelope(signedEnv({ seq: 1.5 })).ok, false);
+});
+test('verifyEnvelope allows null prev_hash but rejects a non-64-hex one', () => {
+  assert.equal(verifyEnvelope(signedEnv({ prev_hash: null })).ok, true);
+  assert.equal(verifyEnvelope(signedEnv({ prev_hash: 'a'.repeat(64) })).ok, true);
+  assert.equal(verifyEnvelope(signedEnv({ prev_hash: 'short' })).ok, false);
+});
+test('verifyEnvelope rejects a non-object payload', () => {
+  assert.equal(verifyEnvelope(signedEnv({ payload: null })).ok, false);
+  assert.equal(verifyEnvelope(signedEnv({ payload: 'x' })).ok, false);
+});
+test('verifyEnvelope rejects a non-128-hex signature', () => {
+  assert.equal(verifyEnvelope(signedEnv({ signature: 'a'.repeat(127) })).ok, false);
+  assert.equal(verifyEnvelope(signedEnv({ signature: 'zz' })).ok, false);
+});
+test('verifyEnvelope requireSig rejects an unsigned envelope, allows it otherwise', () => {
+  assert.equal(verifyEnvelope(signedEnv({ signature: null })).ok, true);            // default: allowed
+  const r = verifyEnvelope(signedEnv({ signature: null }), { requireSig: true });
+  assert.equal(r.ok, false); assert.match(r.reason, /signature required/);
+});
+test('verifyEnvelope freshness window rejects stale and future-dated envelopes', () => {
+  const now = Date.parse('2026-07-29T12:00:00.000Z');
+  const at = (iso) => verifyEnvelope(signedEnv({ ts: iso }), { maxSkewMs: 120000, now });
+  assert.equal(at('2026-07-29T12:00:30.000Z').ok, true);   // 30s → inside 2-min window
+  assert.equal(at('2026-07-29T11:57:00.000Z').ok, false);  // 3 min old → stale
+  assert.equal(at('2026-07-29T12:03:00.000Z').ok, false);  // 3 min future → rejected
+  assert.equal(at(new Date(now - 120000).toISOString()).ok, true); // exactly at the edge → accepted (pins > not >=)
+  const r = verifyEnvelope(signedEnv({ ts: 'not-a-date' }), { maxSkewMs: 1, now });
+  assert.equal(r.ok, false); assert.match(r.reason, /parseable/);
+});
+test('verifyEnvelope skips freshness when maxSkewMs is 0 (default)', () => {
+  assert.equal(verifyEnvelope(signedEnv({ ts: '1999-01-01T00:00:00.000Z' })).ok, true);
+});
+
+// ─── federation: FederationLedger ───────────────────────────────────────────
+// The bridge passes a 64-hex SHA-256 digest per envelope; these tests use
+// fixed 64-hex stand-ins and chain prev_hash → the previous envelope's digest,
+// exactly as production does.
+const FORK = 'd'.repeat(64);
+const H0 = '0'.repeat(64), H1 = '1'.repeat(64), H5 = '5'.repeat(64);
+const e0 = () => signedEnv({ fork_pub: FORK, seq: 0, prev_hash: null, payload: { n: 0 } });
+const e1 = () => signedEnv({ fork_pub: FORK, seq: 1, prev_hash: H0, payload: { n: 1 } }); // points at e0's digest
+
+test('ledger accepts a new fork, then a consecutive well-chained envelope', () => {
+  const L = new FederationLedger();
+  const r0 = L.accept(e0(), H0);
+  assert.equal(r0.ok, true); assert.equal(r0.fresh, true);
+  const r1 = L.accept(e1(), H1);   // consecutive; e1.prev_hash === H0 (e0's digest)
+  assert.equal(r1.ok, true); assert.equal(r1.gap, false);
+  assert.equal(L.size, 1);
+});
+test('ledger rejects a replay / stale seq', () => {
+  const L = new FederationLedger();
+  L.accept(e0(), H0); L.accept(e1(), H1);
+  const r = L.accept(e1(), H1);    // seq 1 again
+  assert.equal(r.ok, false); assert.match(r.reason, /replay|stale/);
+});
+test('ledger rejects a chain break on consecutive seq', () => {
+  const L = new FederationLedger();
+  L.accept(e0(), H0);
+  const forged = signedEnv({ fork_pub: FORK, seq: 1, prev_hash: 'f'.repeat(64), payload: { n: 9 } });
+  const r = L.accept(forged, H1); // prev_hash 'fff…' !== H0 (e0's digest)
+  assert.equal(r.ok, false); assert.match(r.reason, /chain break/);
+});
+test('ledger accepts across a gap but flags linkage as unverifiable', () => {
+  const L = new FederationLedger();
+  L.accept(e0(), H0);
+  const far = signedEnv({ fork_pub: FORK, seq: 5, prev_hash: 'e'.repeat(64), payload: { n: 5 } });
+  const r = L.accept(far, H5);     // seq jumps 0 -> 5: linkage can't be checked
+  assert.equal(r.ok, true); assert.equal(r.gap, true);
+});
+test('ledger requires a 64-hex envHash', () => {
+  const L = new FederationLedger();
+  assert.equal(L.accept(e0(), 'short').ok, false);
+  assert.equal(L.accept(e0(), undefined).ok, false);
+});
+test('ledger bounds the fork table and LRU-evicts (no lockout DoS)', () => {
+  const L = new FederationLedger({ maxForks: 2 });
+  const mk = (c) => signedEnv({ fork_pub: c.repeat(64), seq: 0 });
+  assert.equal(L.accept(mk('1'), H0).ok, true);
+  assert.equal(L.accept(mk('2'), H0).ok, true);
+  const r = L.accept(mk('3'), H0);   // over cap → evict LRU (fork '1'), accept '3'
+  assert.equal(r.ok, true);
+  assert.equal(L.size, 2);
+  assert.equal(L.known('1'.repeat(64)), false); // least-recently-seen evicted
+  assert.equal(L.known('3'.repeat(64)), true);
+});
+test('ledger snapshot round-trips high-water and blocks replay after restore', () => {
+  const L = new FederationLedger();
+  L.accept(e0(), H0); L.accept(e1(), H1);          // fork advanced to seq 1
+  const snap = L.snapshot();
+  assert.equal(snap[FORK].lastSeq, 1);
+  // a reloaded ledger restored from the snapshot must reject the old seq-1 replay
+  const L2 = new FederationLedger({ initial: snap });
+  assert.equal(L2.accept(e1(), H1).ok, false);     // replay after "reload" → rejected
+  assert.equal(L2.known(FORK), true);
+});
+test('ledger restore skips malformed snapshot entries (truthy but no integer lastSeq)', () => {
+  const L = new FederationLedger({ initial: { [FORK]: { lastSeq: 'nope' } } });
+  assert.equal(L.known(FORK), false); // invalid entry not restored (guards the && in validation)
+  assert.equal(L.size, 0);
+});
+test('ledger rejects a structurally-invalid or unsigned envelope', () => {
+  const L = new FederationLedger();
+  assert.equal(L.accept(signedEnv({ signature: null }), H0).ok, false); // unsigned off the relay
+  assert.equal(L.accept(signedEnv({ fork_pub: 'bad' }), H0).ok, false);
+});
+
+// ─── federation: SeenCache (loop prevention) ────────────────────────────────
+test('SeenCache add returns true once, false on repeat', () => {
+  const s = new SeenCache(8);
+  assert.equal(s.add('k'), true);
+  assert.equal(s.add('k'), false);
+  assert.equal(s.has('k'), true);
+});
+test('SeenCache evicts oldest past its bound', () => {
+  const s = new SeenCache(2);
+  s.add('a'); s.add('b'); s.add('c');   // 'a' evicted
+  assert.equal(s.has('a'), false);
+  assert.equal(s.has('b'), true);
+  assert.equal(s.has('c'), true);
+  assert.equal(s.size, 2);
+});
+test('fingerprint is a stable hash of the canonical envelope', () => {
+  const e = signedEnv();
+  assert.equal(fingerprint(e), fnv1a(canonicalJSON(e)));
+  assert.equal(fingerprint(e), fingerprint({ ...e }));   // order-independent
 });

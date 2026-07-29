@@ -74,16 +74,32 @@ node --test               # 37 tests
 node ../witness/witness.mjs mutate niceassos-kernel.mjs   # 49/49 killed · clean
 ```
 
+## Cross-machine federation
+
+Two boxes' meshes federate over an **untrusted WebSocket relay**
+(`scripts/relay-server.mjs`, zero-dep protocol in `niceassos-relay.mjs`). The
+relay only carries; every node re-verifies on receipt — structure, **Ed25519
+signature**, `FederationLedger` replay/chain, `SeenCache` loop dedup. A forged or
+replayed envelope is rejected; only verified envelopes reach the local mesh.
+
+```bash
+node scripts/relay-server.mjs                 # ws://localhost:17346/  (on a box both can reach)
+node integration/federation.mjs               # end-to-end proof: 2 machines, forgery + replay rejected
+```
+
+Enable it in the OS by opening `fallos.html?relay=ws://host:port/&room=fed` on
+each machine, or `installOS({ federate: { url, room } })`. See [`SPEC.md`](./SPEC.md) §6.
+
 ## What's real vs what's next
 
 **Real and verified:** the signed mesh, the blob-iframe sandbox, the hash chain,
-the data-driven routing, proof-of-play admission, the cascade tiering, the
-launch→signed-`fork_join` loop.
+data-driven routing, proof-of-play admission, the cascade tiering, the
+launch→signed-`fork_join` loop, and **cross-machine federation** (relay carrier +
+sign/chain/replay verification on receipt).
 
-**The one genuinely-missing capability:** cross-*machine* transport. Today the
-mesh is same-machine cross-tab (BroadcastChannel). The bridge already carries a
-`fallrelay` WebSocket seam; federating two boxes' meshes over that relay (or
-WebRTC) is the next build — see [`SPEC.md`](./SPEC.md) §6.
+**Next:** a WebRTC carrier (browser-to-browser, no relay) as a drop-in
+alternative transport; the full estate app set mounted as gated organs; the
+remote AI tier wired in-browser (today it's the si-didy-agent cockpit).
 
 ## License
 

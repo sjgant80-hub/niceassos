@@ -194,8 +194,143 @@ export function cascade(task = {}, caps = {}) {
   return { tier: 'none', reason: 'no intelligence worker available' };
 }
 
+// ─── federation: trusting envelopes that crossed an UNTRUSTED relay ─────────
+// Cross-machine transport (§6): a relay carries signed envelopes between boxes.
+// The relay is a DUMB CARRIER — it cannot forge (envelopes are Ed25519-signed
+// and prev_hash-chained), only carry or drop. Every node re-verifies on receipt.
+// These primitives are the receiver's trust logic — pure, so they can be gated.
+
+export const HEX64 = /^[0-9a-f]{64}$/;
+export const HEX128 = /^[0-9a-f]{128}$/;
+
+// verifyEnvelope — STRUCTURAL gate for an incoming envelope. Pure. The
+// cryptographic Ed25519 check needs Web Crypto and is done in the bridge; it
+// MUST pass before a node trusts the envelope. `requireSig` rejects unsigned
+// envelopes — always set for anything off an untrusted relay.
+// Options: requireSig rejects unsigned envelopes; maxSkewMs (>0) rejects an
+// envelope whose ts is more than that far from `now` (injected clock) — a
+// freshness window that bounds how long a captured signed envelope can be
+// replayed by an untrusted relay after a reconnect/reload.
+export function verifyEnvelope(env, { requireSig = false, maxSkewMs = 0, now = 0 } = {}) {
+  if (!env || typeof env !== 'object') return { ok: false, reason: 'not an object' };
+  if (env.version !== VERSION) return { ok: false, reason: `wrong version: ${env.version}` };
+  if (!KINDS.includes(env.kind)) return { ok: false, reason: `unknown kind: ${env.kind}` };
+  if (typeof env.fork_pub !== 'string' || !HEX64.test(env.fork_pub)) return { ok: false, reason: 'fork_pub must be 64-hex' };
+  if (typeof env.ts !== 'string' || !env.ts) return { ok: false, reason: 'ts required' };
+  if (!Number.isInteger(env.seq) || env.seq < 0) return { ok: false, reason: 'seq must be a non-negative integer' };
+  if (env.prev_hash !== null && !(typeof env.prev_hash === 'string' && HEX64.test(env.prev_hash))) return { ok: false, reason: 'prev_hash must be null or 64-hex' };
+  if (env.payload === null || typeof env.payload !== 'object') return { ok: false, reason: 'payload must be an object' };
+  if (env.signature !== null && !(typeof env.signature === 'string' && HEX128.test(env.signature))) return { ok: false, reason: 'signature must be null or 128-hex' };
+  if (requireSig && env.signature === null) return { ok: false, reason: 'signature required from an untrusted source' };
+  if (maxSkewMs > 0) {
+    const t = Date.parse(env.ts);
+    if (Number.isNaN(t)) return { ok: false, reason: 'ts is not a parseable date' };
+    if (Math.abs(now - t) > maxSkewMs) return { ok: false, reason: 'stale or future-dated (ts outside freshness window)' };
+  }
+  return { ok: true, reason: 'well-formed' };
+}
+
+// FederationLedger — per-fork replay + chain tracking across the relay.
+// accept() ASSUMES the Ed25519 signature has already been cryptographically
+// verified by the caller (the bridge). It enforces: structure (requireSig),
+// monotonic seq (replay defense), prev_hash linkage on consecutive envelopes
+// (tamper detection on the happy path), a bounded fork table (memory-DoS
+// defense), and honestly flags gaps where linkage cannot be checked.
+export class FederationLedger {
+  // `initial` rehydrates a persisted snapshot (the bridge stores this in
+  // IndexedDB so the high-water survives reload/reconnect — otherwise an
+  // untrusted relay could replay a fork's whole genuine history against a
+  // fresh empty ledger).
+  constructor({ maxForks = 1024, initial = null } = {}) {
+    this.maxForks = maxForks;
+    this.forks = new Map(); // fork_pub -> { lastSeq, lastHash, seen }
+    this.tick = 0;
+    if (initial && typeof initial === 'object') {
+      for (const k of Object.keys(initial)) {
+        const v = initial[k];
+        if (v && Number.isInteger(v.lastSeq)) {
+          this.forks.set(k, { lastSeq: v.lastSeq, lastHash: v.lastHash, seen: ++this.tick });
+        }
+      }
+    }
+  }
+  // envHash: the 64-hex digest of THIS envelope, computed by the caller. In
+  // production that is the bridge's SHA-256 over canonicalJSON(env) — the same
+  // function the sender used to fill the NEXT envelope's prev_hash. The ledger
+  // never hashes (SHA-256 is async; the ledger is pure + sync).
+  accept(env, envHash) {
+    const struct = verifyEnvelope(env, { requireSig: true });
+    if (!struct.ok) return { ok: false, reason: struct.reason };
+    if (typeof envHash !== 'string' || !HEX64.test(envHash)) {
+      return { ok: false, reason: 'envHash must be the 64-hex digest of this envelope' };
+    }
+    const fork = env.fork_pub;
+    const rec = this.forks.get(fork);
+    if (!rec) {
+      // at capacity: EVICT the least-recently-active fork rather than lock out
+      // all new peers. Durable replay protection lives in the persisted snapshot.
+      if (this.forks.size >= this.maxForks) {
+        let oldestKey = null, oldest = Infinity;
+        for (const [k, r] of this.forks) if (r.seen < oldest) { oldest = r.seen; oldestKey = k; }
+        if (oldestKey !== null) this.forks.delete(oldestKey);
+      }
+      this.forks.set(fork, { lastSeq: env.seq, lastHash: envHash, seen: ++this.tick });
+      return { ok: true, reason: 'new fork', gap: false, fresh: true };
+    }
+    if (env.seq <= rec.lastSeq) return { ok: false, reason: 'replay or stale (seq not ahead of last seen)' };
+    const consecutive = env.seq === rec.lastSeq + 1;
+    if (consecutive && env.prev_hash !== rec.lastHash) {
+      return { ok: false, reason: 'chain break — prev_hash does not match last accepted' };
+    }
+    rec.lastSeq = env.seq;
+    rec.lastHash = envHash;
+    rec.seen = ++this.tick;
+    return { ok: true, reason: consecutive ? 'accepted' : 'accepted across gap (linkage unverifiable)', gap: !consecutive, fresh: false };
+  }
+  // export the high-water map for durable persistence (bridge → IndexedDB)
+  snapshot() {
+    const out = {};
+    for (const [k, r] of this.forks) out[k] = { lastSeq: r.lastSeq, lastHash: r.lastHash };
+    return out;
+  }
+  known(fork) { return this.forks.has(fork); }
+  get size() { return this.forks.size; }
+}
+
+// SeenCache — bounded FIFO of envelope hashes for LOOP PREVENTION. The bridge
+// records every envelope it has already handled (relayed out or received in);
+// a hash already seen is never re-relayed, killing echo loops in both
+// directions regardless of how the relay fans out. Bounded so it can't grow
+// without limit under sustained traffic.
+export class SeenCache {
+  constructor(max = 4096) {
+    this.max = max;
+    this.set = new Set();
+    this.queue = [];
+  }
+  has(key) { return this.set.has(key); }
+  // returns true if newly added, false if it was already present
+  add(key) {
+    if (this.set.has(key)) return false;
+    this.set.add(key);
+    this.queue.push(key);
+    while (this.queue.length > this.max) {
+      const evicted = this.queue.shift();
+      this.set.delete(evicted);
+    }
+    return true;
+  }
+  get size() { return this.set.size; }
+}
+
+// envelope fingerprint used by SeenCache / dedup (hash over the canonical form)
+export function fingerprint(env, hasher = fnv1a) {
+  return hasher(canonicalJSON(env));
+}
+
 export default {
-  VERSION, KAPPA, KINDS,
+  VERSION, KAPPA, KINDS, HEX64, HEX128,
   canonicalJSON, fnv1a, envelope, MeshLog,
   admit, ringGlyph, route, organEvent, cascade,
+  verifyEnvelope, FederationLedger, SeenCache, fingerprint,
 };

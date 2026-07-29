@@ -5,7 +5,10 @@
   "type": "module",
   "main": "niceassos-kernel.mjs",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "test:fed": "node integration/federation.mjs",
+    "relay": "node scripts/relay-server.mjs",
+    "serve": "node scripts/serve.mjs"
   },
   "license": "MIT",
   "author": "Simon Gant",

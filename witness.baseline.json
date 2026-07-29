@@ -1,0 +1,12 @@
+[
+  {
+    "mutation": "< → <=",
+    "snippet": "for (let i = 0; i < len; i++) out[i] = payload[i] ^ mask[i & 3];",
+    "reason": "reviewed-equivalent: `out` is Buffer.alloc(len); the extra i===len iteration writes out[len], an out-of-bounds Buffer index that is silently dropped, so the decoded message is byte-identical. Empirically confirmed: applying <= keeps the full relay suite green. Self-invalidates if this line changes."
+  },
+  {
+    "mutation": "< → <=",
+    "snippet": "for (const [k, r] of this.forks) if (r.seen < oldest) { oldest = r.seen; oldestKey = k; }",
+    "reason": "reviewed-equivalent: this is a min-search over `seen`, which is assigned ++this.tick everywhere and is therefore strictly unique per fork — no two forks ever share a `seen`, so < and <= select the same fork. Empirically confirmed: applying <= keeps the full suite green. Self-invalidates if this line changes."
+  }
+]

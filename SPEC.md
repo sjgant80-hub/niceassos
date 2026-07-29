@@ -39,6 +39,8 @@ bridge; the kernel never signs and never sees a private key.
 - `route(env, organs)` — §3 routing.
 - `cascade(task, caps)` — §4 brain tiering.
 - `ringGlyph(ring)` — R0..R6 glyphs; out-of-range → neutral `·`.
+- `verifyEnvelope(env, {requireSig})`, `FederationLedger`, `SeenCache`,
+  `fingerprint` — §6 federation trust primitives (receiver-side, pure).
 
 The bridge injects the real `sha256` hasher and Ed25519 signer; the kernel's
 default `fnv1a` hasher exists only so the core is self-testable with zero deps.
@@ -89,22 +91,68 @@ The bridge's local tier is the `fallrelay` WebSocket worker
 - **`handleAIRequest`** → serves through `cascade`; honest degrade, never a fake
   "processing" placeholder.
 
-## §6 · Cross-machine (next)
+## §6 · Cross-machine federation (BUILT)
 
-The mesh is same-machine cross-tab (BroadcastChannel). The bridge carries a
-`fallrelay` WebSocket seam already. Federation of two boxes' meshes:
+Two boxes' meshes federate over an **untrusted WebSocket relay**. The relay
+(`scripts/relay-server.mjs`, protocol in `niceassos-relay.mjs`) is a dumb carrier
+— it re-frames and fans signed envelopes to room-mates and holds no keys and no
+trust. Every node re-verifies on receipt, in the bridge's `connectFederation`:
 
-1. **relay path (achievable now):** a dumb WS relay rebroadcasts signed envelopes
-   between machines; signatures + `prev_hash` chains make the relay untrusted —
-   it cannot forge, only carry. Per-fork chains are verified on receipt.
-2. **WebRTC path (stretch):** browser-to-browser via the existing `fallswarm`
-   transport once built.
+1. **structure** — `verifyEnvelope(env, {requireSig:true})` (pure kernel).
+2. **signature** — Ed25519 verify against the envelope's own `fork_pub`, over
+   `canonicalJSON(env-minus-signature)`. A tampered payload fails here → the
+   relay cannot forge.
+3. **replay / chain** — `FederationLedger.accept(env, sha256)`: monotonic seq per
+   fork (replay defense), `prev_hash` linkage on consecutive envelopes (tamper
+   detection), a bounded fork table (memory-DoS defense), honest gap flagging.
+4. **loop dedup** — `SeenCache` on the envelope digest, applied to both the
+   receive path and the forward path, so an echo can never loop.
 
-Envelopes are already transport-agnostic and self-authenticating, so §6 adds a
-carrier, not a trust model.
+Only after all four does a remote envelope get injected onto the local mesh. A
+box enables federation with `installOS({ federate: { url, room } })`, or the OS
+shell reads `?relay=ws://host:port/&room=fed`.
+
+**Transport model.** Envelopes are transport-agnostic and self-authenticating,
+so the relay adds a carrier, not a trust model. A WebRTC carrier (browser-to-
+browser via `fallswarm`) is a drop-in alternative once built — same envelopes,
+same four checks.
+
+**Proven** (see [`VERIFICATION.md`](./VERIFICATION.md)): `node integration/federation.mjs`
+— two Ed25519 machines federate, a forged payload is rejected, a replay is
+rejected, bidirectional; and live browser→relay→remote with signature
+verification on the far side.
+
+## §6a · Federation hardening (adversarial-review outcomes)
+
+An adversarial review of the trust boundary drove these fixes, all tested:
+
+- **emit() serialized** — overlapping async emits no longer interleave; `seq` and
+  `prev_hash` advance atomically (proven under 15 concurrent emits, chain intact).
+- **Relay DoS caps** — `decodeFrames` flags an over-cap declared length
+  (`tooBig`); the server enforces a per-frame cap, a per-socket buffer cap, a
+  connection cap, and an idle/slowloris timeout.
+- **Reconnect-replay closed** — the `FederationLedger` high-water is persisted to
+  IndexedDB per room and rehydrated on connect, and `verifyEnvelope` enforces a
+  `±5 min` freshness window, so a relay cannot replay a fork's old signed history
+  against a fresh ledger.
+- **Fork-table LRU** — capacity is enforced by evicting the least-recently-active
+  fork, not by locking out all new peers.
+- **Local ingress dedup** — an envelope arriving on both the mesh and legacy
+  channels is delivered to listeners once.
+
+**Known limitations (documented, not yet fixed):**
+- **One federating tab per machine.** Multiple tabs share one fork identity but
+  keep independent chains; run the OS in a single tab, or add leader election
+  (Web Locks) so one tab owns the relay socket and the chain.
+- **RFC 6455 completeness.** The codec assumes the small, single-frame, masked
+  JSON messages real browser/Node clients send; it does not enforce client
+  masking or reassemble fragmented (FIN=0) messages. The relay never trusts a
+  payload, so these are robustness items, not trust holes.
 
 ## §7 · Non-goals for this build
 
+- WebRTC (browser-to-browser) carrier — the relay carrier is built; WebRTC is a
+  drop-in alternative transport, same envelopes and same four checks.
 - Remote AI tier in-browser (use the si-didy-agent cockpit).
 - Hard-blocking admission (logged, switchable).
 - The full estate app set mounted (FallMesh is the reference organ; the rest

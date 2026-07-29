@@ -32,13 +32,29 @@ one sovereign browser OS. See [`README.md`](./README.md) and [`SPEC.md`](./SPEC.
 - **Admission is proof-of-play.** Don't loosen `admit` to mount un-konomified
   organs; if you need a dev bypass, gate it behind an explicit flag, logged.
 
+## Federation (§6)
+
+- `niceassos-relay.mjs` — **pure** WS protocol (frame codec + `Rooms` fan-out).
+  Witnessed. One reviewed-equivalent baselined in `witness.baseline.json`.
+- `scripts/relay-server.mjs` — socket glue (I/O, not witnessed). `start(port)`
+  is importable so `integration/federation.mjs` can spin it up.
+- Bridge `connectFederation` — the receiver trust path: `verifyEnvelope` →
+  Ed25519 verify → `FederationLedger.accept` → `SeenCache` dedup → inject.
+- Run a relay: `node scripts/relay-server.mjs`. Federate the OS:
+  `fallos.html?relay=ws://host:port/&room=fed`.
+
 ## Gates
 
 ```bash
-node --test                                           # 37 kernel tests
-node ../witness/witness.mjs mutate niceassos-kernel.mjs  # must stay 49/49 · clean
-node ../konomify/konomify.mjs .                        # repo gate
+node --test                                           # unit tests (kernel + relay), fast/pure
+node integration/federation.mjs                       # end-to-end federation proof (real sockets)
+node ../witness/witness.mjs mutate niceassos-kernel.mjs  # kernel: must stay clean
+node ../witness/witness.mjs mutate niceassos-relay.mjs   # relay: 20/21 + 1 baselined equivalent
+node ../konomify/konomify.mjs .                        # repo gate (non-masking: witnesses every root .mjs)
 ```
+
+Note `node --test` deliberately does NOT run `integration/` (it's outside the
+test glob) so the mutation gate stays fast and pure.
 
 After any kernel edit: re-run witness. A surviving mutant means a new line is
 unguarded — add the boundary test, don't baseline unless it's a genuine reviewed
