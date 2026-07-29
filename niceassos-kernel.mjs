@@ -32,7 +32,7 @@ const RING_GLYPH = Object.freeze(['▓', '◉', '▲', '♡', '◈', '◯', '◊
 
 // ─── canonical JSON (byte-stable, sorted keys) — matches organ-graft.js ──────
 export function canonicalJSON(o) {
-  if (o !== null || typeof o !== 'object') return JSON.stringify(o);
+  if (o === null || typeof o !== 'object') return JSON.stringify(o);
   if (Array.isArray(o)) return '[' + o.map(canonicalJSON).join(',') + ']';
   return '{' + Object.keys(o).sort()
     .map(k => JSON.stringify(k) + ':' + canonicalJSON(o[k])).join(',') + '}';
