@@ -93,10 +93,19 @@ The bridge's local tier is the `fallrelay` WebSocket worker
 
 ## §6 · Cross-machine federation (BUILT)
 
-Two boxes' meshes federate over an **untrusted WebSocket relay**. The relay
-(`scripts/relay-server.mjs`, protocol in `niceassos-relay.mjs`) is a dumb carrier
-— it re-frames and fans signed envelopes to room-mates and holds no keys and no
-trust. Every node re-verifies on receipt, in the bridge's `connectFederation`:
+Two boxes' meshes federate over a **carrier**. Carriers are interchangeable — the
+envelopes are self-authenticating, so a carrier only carries. The receive path
+(the four checks below), the `shouldFederate` forwarding, the `FederationLedger`,
+persistence and dedup are **transport-agnostic** (`makeFedContext` / `fedReceive` /
+`fedForward` in the bridge); each carrier just supplies a wire.
+
+- **Carrier 1 — WebSocket relay** (`connectFederation`): a dumb, untrusted relay
+  (`scripts/relay-server.mjs`, protocol in `niceassos-relay.mjs`) fans signed
+  envelopes to room-mates. Web Locks leader election (§6a).
+- **Carrier 2 — WebRTC data channel** (`connectFederationRTC`): peer-to-peer, **no
+  relay in the data path** (§6b).
+
+Every node re-verifies on receipt, whichever carrier delivered the envelope:
 
 1. **structure** — `verifyEnvelope(env, {requireSig:true})` (pure kernel).
 2. **signature** — Ed25519 verify against the envelope's own `fork_pub`, over
@@ -157,10 +166,48 @@ An adversarial review of the trust boundary drove these fixes, all tested:
   masking or reassemble fragmented (FIN=0) messages. The relay never trusts a
   payload, so these are robustness items, not trust holes.
 
+## §6b · WebRTC carrier — relay-free, peer-to-peer (BUILT)
+
+`connectFederationRTC` federates two boxes over an **RTCDataChannel with no relay
+in the data path**. It reuses the exact same engine as the WS carrier
+(`fedReceive` / `fedForward` / the four checks / `shouldFederate`); only the wire
+differs. `makeRTCCarrier` wires an `RTCPeerConnection` + a `niceassos-fed` data
+channel.
+
+- **Signaling is out-of-band.** Non-trickle ICE: the carrier gathers all
+  candidates, then hands back **one** offer/answer blob for exchange by any means
+  (copy-paste, QR, a file) — so a connection needs **no signaling server**. The
+  blob is untrusted input: `validSignal` (pure kernel) checks its shape before it
+  reaches `setRemoteDescription`. Flow: initiator `createOffer()` → peer
+  `acceptOffer(offer)` → initiator `acceptAnswer(answer)` → the channel opens.
+- **Signals are signed + verified.** Each blob is Ed25519-signed over
+  `(v,type,room,from,sha256(sdp))` and the peer verifies it against the blob's own
+  `from` before `setRemoteDescription` — so a signal tampered in transit is
+  rejected. This is tamper-evidence, not full MITM immunity: because `from` rides
+  in the blob, a transparent MITM over an *untrusted* signaling channel could
+  substitute its own key-pair. For MITM protection, **confirm the peer's `from`
+  fork_pub out-of-band** (compare the short prefix), or exchange the blob over a
+  channel you already trust (in person, an authenticated messenger). Envelope
+  trust is separate and always holds: every envelope is Ed25519-verified on
+  receipt, so signaling compromise can censor/observe but never *inject* data.
+- **Zero external dependency by default.** `iceServers` is empty → host candidates
+  (same machine / LAN). A STUN server is only needed for internet NAT traversal
+  (it reflects your IP; it never carries data). No TURN — that would reintroduce a
+  relay.
+- **Same engine, same guarantees.** Ledger persistence, `fedhw` seq continuity,
+  `SeenCache` dedup, and `shouldFederate` coherence all apply over WebRTC.
+
+Enable it: `installOS(...)` then `os.federateRTC({ room, iceServers? })` and drive
+the offer/answer exchange. *Verified: two tabs established a direct data channel
+via copy-paste signaling; envelopes flowed bidirectionally, all four-check
+verified (`rejected: 0`), with the relay at **0 connections** — genuinely
+relay-free.*
+
 ## §7 · Non-goals for this build
 
-- WebRTC (browser-to-browser) carrier — the relay carrier is built; WebRTC is a
-  drop-in alternative transport, same envelopes and same four checks.
+- Auto-signaling for WebRTC (rendezvous via the existing relay for handshake-only,
+  then P2P) — the relay-free manual path is built; auto-signaling with
+  `politePeer` glare resolution is a convenience layer on top.
 - Remote AI tier in-browser (use the si-didy-agent cockpit).
 - Hard-blocking admission (logged, switchable).
 - The full estate app set mounted (FallMesh is the reference organ; the rest

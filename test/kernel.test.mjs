@@ -1,9 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  VERSION, KAPPA, KINDS, canonicalJSON, fnv1a, envelope, MeshLog,
+  VERSION, KAPPA, KINDS, SIGNAL_VERSION, canonicalJSON, fnv1a, envelope, MeshLog,
   admit, ringGlyph, route, organEvent, cascade,
   verifyEnvelope, FederationLedger, SeenCache, fingerprint, shouldFederate,
+  validSignal, politePeer,
 } from '../niceassos-kernel.mjs';
 
 test('KAPPA is (√5−1)/2 ≈ 0.618, not φ', () => {
@@ -388,4 +389,34 @@ test('shouldFederate forwards own emits, forwards foreign forks, skips same-fork
   assert.equal(shouldFederate({ fork_pub: other }, me, false), true); // a real other organ → forward
   assert.equal(shouldFederate(null, me, false), false);              // junk → skip
   assert.equal(shouldFederate({}, me, false), false);                // no fork_pub → skip
+});
+
+// ─── WebRTC signaling (validSignal / politePeer) ────────────────────────────
+const PUB64 = 'c'.repeat(64);
+const offerSig = (over = {}) => ({ v: SIGNAL_VERSION, type: 'offer', from: PUB64, room: 'fed', sdp: 'v=0...', ...over });
+
+test('validSignal accepts a well-formed offer, answer, and candidate', () => {
+  assert.equal(validSignal(offerSig()).ok, true);
+  assert.equal(validSignal(offerSig({ type: 'answer' })).ok, true);
+  assert.equal(validSignal(offerSig({ type: 'candidate', sdp: undefined, candidate: 'candidate:1 ...' })).ok, true);
+});
+test('validSignal rejects junk, wrong version, unknown type', () => {
+  assert.equal(validSignal(null).ok, false);
+  assert.equal(validSignal(offerSig({ v: 'nope' })).ok, false);
+  assert.equal(validSignal(offerSig({ type: 'bogus' })).ok, false);
+});
+test('validSignal rejects a bad from and missing room', () => {
+  assert.equal(validSignal(offerSig({ from: 'short' })).ok, false);
+  assert.equal(validSignal(offerSig({ room: '' })).ok, false);
+});
+test('validSignal requires sdp for offer/answer and candidate for candidate', () => {
+  assert.equal(validSignal(offerSig({ sdp: '' })).ok, false);
+  const r = validSignal(offerSig({ type: 'candidate', sdp: undefined, candidate: '' }));
+  assert.equal(r.ok, false); assert.match(r.reason, /candidate/);
+});
+test('politePeer picks the lexicographically smaller fork, guards non-strings', () => {
+  assert.equal(politePeer('a'.repeat(64), 'b'.repeat(64)), true);   // a < b → polite
+  assert.equal(politePeer('b'.repeat(64), 'a'.repeat(64)), false);  // b > a → impolite
+  assert.equal(politePeer('a'.repeat(64), 'a'.repeat(64)), false);  // equal → not polite (guards < vs <=)
+  assert.equal(politePeer(null, 'a'.repeat(64)), false);
 });

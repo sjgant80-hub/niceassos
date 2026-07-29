@@ -79,3 +79,17 @@ Two OS tabs opened on one machine, both with `?relay=…&room=fed`:
 | Automatic failover | navigating the leader tab away → tab 2 auto-promoted to `{leader:true, connected:true}`; relay still 1 connection |
 | Coherent forwarding | `shouldFederate` unit-tested: forwards own emits + foreign forks, skips a sibling tab's same-fork envelopes |
 | No seq regression on failover | new leader resumes above the persisted `fedhw` high-water (ledger snapshot/restore unit-tested) |
+
+## WebRTC carrier — relay-free, peer-to-peer
+
+Two OS tabs, connected via `os.federateRTC()` with the offer/answer blobs
+exchanged out-of-band (copy-paste), **no relay running in the data path**:
+
+| Claim | Evidence |
+|---|---|
+| Direct data channel establishes | both tabs → `{connected:true, transport:'rtc'}` (roles initiator/answerer) via host candidates, no STUN |
+| Envelopes flow peer-to-peer | initiator `sent:2`; answerer `recv:3` (incl. a boot beacon), bidirectional |
+| Four-check verification over RTC | `rejected:0` on both — every envelope passed structure + Ed25519 + ledger + dedup |
+| No relay in the data path | relay reported **0 connections** during the entire RTC exchange |
+| Signaling is validated | `validSignal` unit-tested (offer/answer/candidate shape, bad version/from/room rejected) |
+| WS path unregressed by the refactor | tab was `{connected:true, leader:true, transport:'ws'}` before switching carriers |

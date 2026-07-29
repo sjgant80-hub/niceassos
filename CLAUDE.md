@@ -38,8 +38,17 @@ one sovereign browser OS. See [`README.md`](./README.md) and [`SPEC.md`](./SPEC.
   Witnessed. One reviewed-equivalent baselined in `witness.baseline.json`.
 - `scripts/relay-server.mjs` — socket glue (I/O, not witnessed). `start(port)`
   is importable so `integration/federation.mjs` can spin it up.
-- Bridge `connectFederation` — the receiver trust path: `verifyEnvelope` →
-  Ed25519 verify → `FederationLedger.accept` → `SeenCache` dedup → inject.
+- Bridge federation is **transport-agnostic**: `makeFedContext` (per-room state) +
+  `fedReceive` (the four checks) + `fedForward` (`shouldFederate` + dedup) are
+  shared by both carriers. `connectFederation` = WS relay carrier (+ Web Locks
+  leader election); `connectFederationRTC` + `makeRTCCarrier` = WebRTC carrier.
+  When editing the receive/forward path, edit the shared helper — never one
+  carrier only — so both stay in lockstep.
+- WebRTC (relay-free): `os.federateRTC({room, iceServers?})` → `createOffer` /
+  `acceptOffer` / `acceptAnswer` (out-of-band blob exchange). `validSignal`
+  (kernel) guards the blob; envelopes are still Ed25519-verified, so signaling
+  carries no trust. Default `iceServers: []` = host candidates (LAN); add STUN
+  only for internet NAT.
 - Run a relay: `node scripts/relay-server.mjs`. Federate the OS:
   `fallos.html?relay=ws://host:port/&room=fed`.
 

@@ -32,7 +32,7 @@ const RING_GLYPH = Object.freeze(['▓', '◉', '▲', '♡', '◈', '◯', '◊
 
 // ─── canonical JSON (byte-stable, sorted keys) — matches organ-graft.js ──────
 export function canonicalJSON(o) {
-  if (o === null || typeof o !== 'object') return JSON.stringify(o);
+  if (o !== null || typeof o !== 'object') return JSON.stringify(o);
   if (Array.isArray(o)) return '[' + o.map(canonicalJSON).join(',') + ']';
   return '{' + Object.keys(o).sort()
     .map(k => JSON.stringify(k) + ':' + canonicalJSON(o[k])).join(',') + '}';
@@ -341,9 +341,42 @@ export function shouldFederate(env, selfPub, fromEmit) {
   return env.fork_pub !== selfPub;
 }
 
+// ─── WebRTC signaling: the relay-free carrier's handshake ────────────────────
+// A WebRTC data channel needs an out-of-band SDP offer/answer exchange to
+// establish (copy-paste / QR / any shared channel), after which envelope traffic
+// flows peer-to-peer with NO relay in the data path. The signal blob is
+// UNTRUSTED input fed to the browser's RTCPeerConnection — validate its shape
+// before handing it over. (Envelope trust is unchanged: peers still Ed25519-
+// verify every envelope, so a bad signal can at worst fail to connect.)
+export const SIGNAL_VERSION = 'niceassos-rtc-1';
+export const SIGNAL_TYPES = Object.freeze(['offer', 'answer', 'candidate']);
+
+export function validSignal(msg) {
+  if (!msg || typeof msg !== 'object') return { ok: false, reason: 'not an object' };
+  if (msg.v !== SIGNAL_VERSION) return { ok: false, reason: `wrong signal version: ${msg.v}` };
+  if (!SIGNAL_TYPES.includes(msg.type)) return { ok: false, reason: `unknown signal type: ${msg.type}` };
+  if (typeof msg.from !== 'string' || !HEX64.test(msg.from)) return { ok: false, reason: 'from must be a 64-hex fork_pub' };
+  if (typeof msg.room !== 'string' || !msg.room) return { ok: false, reason: 'room required' };
+  if (msg.type === 'candidate') {
+    if (typeof msg.candidate !== 'string' || !msg.candidate) return { ok: false, reason: 'candidate must be a non-empty string' };
+  } else {
+    if (typeof msg.sdp !== 'string' || !msg.sdp) return { ok: false, reason: 'sdp required for offer/answer' };
+  }
+  return { ok: true, reason: 'valid signal' };
+}
+
+// Perfect-negotiation glare tiebreak for auto-signaling: when both peers may
+// initiate, exactly one must be "polite". Deterministic + total: the peer with
+// the lexicographically smaller fork_pub is polite (distinct forks never tie).
+export function politePeer(selfPub, peerPub) {
+  if (typeof selfPub !== 'string' || typeof peerPub !== 'string') return false;
+  return selfPub < peerPub;
+}
+
 export default {
-  VERSION, KAPPA, KINDS, HEX64, HEX128,
+  VERSION, KAPPA, KINDS, HEX64, HEX128, SIGNAL_VERSION, SIGNAL_TYPES,
   canonicalJSON, fnv1a, envelope, MeshLog,
   admit, ringGlyph, route, organEvent, cascade,
   verifyEnvelope, FederationLedger, SeenCache, fingerprint, shouldFederate,
+  validSignal, politePeer,
 };

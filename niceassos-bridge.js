@@ -16,8 +16,8 @@
  *   os.requestAI({ prompt, tokens }, onToken);   // cascade: local-first, remote fallback
  */
 import {
-  VERSION, MeshLog, canonicalJSON, admit, route, cascade, ringGlyph, organEvent,
-  verifyEnvelope, FederationLedger, SeenCache, fingerprint, shouldFederate,
+  VERSION, SIGNAL_VERSION, MeshLog, canonicalJSON, admit, route, cascade, ringGlyph, organEvent,
+  verifyEnvelope, FederationLedger, SeenCache, fingerprint, shouldFederate, validSignal,
 } from './niceassos-kernel.mjs';
 
 const FRESHNESS_MS = 300000; // reject relayed envelopes whose ts is >5 min off — bounds reconnect-replay
@@ -156,21 +156,18 @@ export async function installOS(opts = {}) {
   const envListeners = new Set();
   const local = makeLocalWorker(opts.relayURL);
 
-  // ── federation: carry this box's mesh to another box over an untrusted relay ─
-  // Envelopes are self-authenticating (Ed25519 + prev_hash chain); the relay
-  // only carries. On receipt every envelope is: structurally checked, signature-
-  // verified against its fork_pub, replay/chain-checked by the FederationLedger,
-  // and deduped (SeenCache) so echoes can't loop. Only then is it injected onto
-  // the local mesh so this box's tabs see the remote organ.
+  // ── federation: carry this box's mesh to another box ─────────────────────────
+  // Transport-agnostic. Envelopes are self-authenticating (Ed25519 + prev_hash
+  // chain), so a CARRIER — a WebSocket relay OR a peer-to-peer WebRTC data
+  // channel — only carries. On receipt every envelope is structurally checked,
+  // signature-verified against its fork_pub, replay/chain-checked (FederationLedger),
+  // deduped (SeenCache), then injected onto the local mesh. Forwarding uses
+  // shouldFederate to keep one coherent chain across sibling tabs.
   let fed = null;
-  function connectFederation(url, room) {
-    room = room || 'fed';
-    const wsurl = url + (url.includes('?') ? '&' : '?') + 'room=' + encodeURIComponent(room);
-    const seen = new SeenCache(4096);
-    const ledgerKey = 'ledger:' + room;
-    const hwKey = 'fedhw:' + room;
-    // hydrate the per-fork high-water from IndexedDB so a reload/reconnect can't
-    // be tricked by the untrusted relay into re-accepting a fork's old history.
+
+  // per-room federation state, shared by every carrier
+  function makeFedContext(room, extra) {
+    const ledgerKey = 'ledger:' + room, hwKey = 'fedhw:' + room;
     let ledger = new FederationLedger();
     const hydrated = (async () => {
       try {
@@ -183,77 +180,203 @@ export async function installOS(opts = {}) {
       if (persistTimer) return;
       persistTimer = setTimeout(() => { persistTimer = null; dbPut(FALLBACK_STORE, FALLBACK_STORE, ledgerKey, ledger.snapshot()).catch(() => {}); }, 500);
     };
-    // our fork's highest FORWARDED seq — persisted so a NEW leader (after this
-    // tab closes) resumes above it and the remote never sees a seq regression.
-    let hwSeq = -1;
+    const hw = { seq: -1, key: hwKey };
     let hwTimer = null;
     const persistHw = () => {
       if (hwTimer) return;
-      hwTimer = setTimeout(() => { hwTimer = null; dbPut(FALLBACK_STORE, FALLBACK_STORE, hwKey, { seq: hwSeq }).catch(() => {}); }, 500);
+      hwTimer = setTimeout(() => { hwTimer = null; dbPut(FALLBACK_STORE, FALLBACK_STORE, hwKey, { seq: hw.seq }).catch(() => {}); }, 500);
     };
+    const stat = Object.assign({ connected: false, sent: 0, recv: 0, rejected: 0, room }, extra || {});
+    return { room, get ledger() { return ledger; }, hydrated, persist, hw, persistHw, seen: new SeenCache(4096), stat };
+  }
 
-    const stat = { connected: false, leader: false, sent: 0, recv: 0, rejected: 0, url: wsurl, room };
+  // resume our fork's seq strictly above the persisted high-water (a gap, so the
+  // remote ledger accepts rather than chain-breaking) — no regression on failover
+  // or reconnect. Shared by every carrier before it starts forwarding.
+  async function resumeSeqAboveHighWater(ctx) {
+    try {
+      const rec = await dbGet(FALLBACK_STORE, FALLBACK_STORE, ctx.hw.key);
+      if (rec && Number.isInteger(rec.seq)) { ctx.hw.seq = rec.seq; if (seq <= ctx.hw.seq) seq = ctx.hw.seq + 2; }
+    } catch (_) {}
+  }
+
+  // the four-check receive path — identical for every carrier
+  async function fedReceive(data, ctx) {
+    let env; try { env = JSON.parse(data); } catch (_) { return; }
+    await ctx.hydrated; // ledger loaded before we judge replay
+    if (!verifyEnvelope(env, { requireSig: true, maxSkewMs: FRESHNESS_MS, now: Date.now() }).ok) { ctx.stat.rejected++; return; }
+    if (!(await verifyRemoteSig(env))) { ctx.stat.rejected++; return; }  // a carrier can't forge
+    const h = await sha256hex(canonicalJSON(env));
+    if (!ctx.ledger.accept(env, h).ok) { ctx.stat.rejected++; return; }  // replay / chain break
+    if (!ctx.seen.add(h)) return;                                        // already handled → no loop
+    ctx.persist(); ctx.stat.recv++;
+    try { mesh && mesh.postMessage(env); } catch (_) {}                  // inject onto local mesh (all tabs see it)
+    envListeners.forEach(fn => { try { fn(env); } catch (_) {} });
+    try { window.dispatchEvent(new CustomEvent('niceassos:fed-recv', { detail: env })); } catch (_) {}
+  }
+
+  // the forward path — identical for every carrier; `send(str)→bool` is the wire
+  async function fedForward(env, fromEmit, ctx, send) {
+    if (!ctx.stat.connected) return;
+    if (!shouldFederate(env, identity.pubHex, !!fromEmit)) return;
+    const h = await sha256hex(canonicalJSON(env));
+    if (ctx.seen.has(h)) return;              // came from the carrier, or already sent → don't echo
+    if (!send(JSON.stringify(env))) return;   // send failed → do NOT mark seen; stays retryable (no chain gap)
+    ctx.seen.add(h);                          // record only after a confirmed send
+    ctx.stat.sent++;
+    if (env.fork_pub === identity.pubHex && Number.isInteger(env.seq) && env.seq > ctx.hw.seq) { ctx.hw.seq = env.seq; ctx.persistHw(); }
+  }
+
+  // ── carrier 1: WebSocket relay (with Web Locks leader election) ──────────────
+  function connectFederation(url, room) {
+    if (fed && fed.stop) { try { fed.stop(); } catch (_) {} } // one active carrier per machine
+    room = room || 'fed';
+    const wsurl = url + (url.includes('?') ? '&' : '?') + 'room=' + encodeURIComponent(room);
+    const ctx = makeFedContext(room, { leader: false, transport: 'ws', url: wsurl });
     let ws = null;
-
+    let releaseLock = null; // resolves the held Web Lock so a queued tab can take over
     function openSocket() {
       try { ws = new WebSocket(wsurl); } catch (_) { return; }
-      ws.onopen = () => { stat.connected = true; try { window.dispatchEvent(new CustomEvent('niceassos:fed-open', { detail: { ...stat } })); } catch (_) {} };
-      ws.onclose = () => { stat.connected = false; if (stat.leader && fed) setTimeout(() => { if (stat.leader && fed) openSocket(); }, 2000); };
-      ws.onerror = () => { stat.connected = false; };
-      ws.onmessage = async (ev) => {
-        let env; try { env = JSON.parse(ev.data); } catch (_) { return; }
-        await hydrated; // ledger loaded before we judge replay
-        if (!verifyEnvelope(env, { requireSig: true, maxSkewMs: FRESHNESS_MS, now: Date.now() }).ok) { stat.rejected++; return; }
-        if (!(await verifyRemoteSig(env))) { stat.rejected++; return; }  // relay can't forge
-        const h = await sha256hex(canonicalJSON(env));
-        if (!ledger.accept(env, h).ok) { stat.rejected++; return; }      // replay / chain break
-        if (!seen.add(h)) return;                                         // already handled → no loop
-        persist();                                                        // durably advance the high-water
-        stat.recv++;
-        try { mesh && mesh.postMessage(env); } catch (_) {}               // inject onto local mesh (all tabs see it)
-        envListeners.forEach(fn => { try { fn(env); } catch (_) {} });
-        try { window.dispatchEvent(new CustomEvent('niceassos:fed-recv', { detail: env })); } catch (_) {}
-      };
+      ws.onopen = () => { ctx.stat.connected = true; try { window.dispatchEvent(new CustomEvent('niceassos:fed-open', { detail: { ...ctx.stat } })); } catch (_) {} };
+      ws.onclose = () => { ctx.stat.connected = false; if (ctx.stat.leader && fed) setTimeout(() => { if (ctx.stat.leader && fed) openSocket(); }, 2000); };
+      ws.onerror = () => { ctx.stat.connected = false; };
+      ws.onmessage = (ev) => fedReceive(ev.data, ctx);
     }
-
     async function becomeLeader() {
-      stat.leader = true;
-      // failover / reboot continuity: resume our fork's seq strictly above the
-      // last forwarded seq (a gap, so the remote ledger accepts rather than
-      // chain-breaking) — no regression, no stall.
-      try {
-        const rec = await dbGet(FALLBACK_STORE, FALLBACK_STORE, hwKey);
-        if (rec && Number.isInteger(rec.seq)) { hwSeq = rec.seq; if (seq <= hwSeq) seq = hwSeq + 2; }
-      } catch (_) {}
+      ctx.stat.leader = true;
+      await resumeSeqAboveHighWater(ctx);
       openSocket();
     }
-
     // LEADER ELECTION (Web Locks): whichever tab holds the exclusive lock is the
-    // machine's federation gateway — the only tab with a relay socket and the
-    // only forwarder. Other tabs queue on the lock; when the leader tab closes,
-    // the lock releases on unload and a queued tab becomes leader automatically.
+    // machine's federation gateway — the only tab with a relay socket and the only
+    // forwarder. The lock releases on tab close OR on stop() (via releaseLock), so
+    // a queued tab takes over on failover, carrier-switch, or re-federate.
     const lockName = 'niceassos-fed:' + room;
     if (typeof navigator !== 'undefined' && navigator.locks && navigator.locks.request) {
-      navigator.locks.request(lockName, { mode: 'exclusive' }, () => new Promise(() => { becomeLeader(); })).catch(() => {});
+      navigator.locks.request(lockName, { mode: 'exclusive' }, () => new Promise((resolve) => { releaseLock = resolve; becomeLeader(); })).catch(() => {});
     } else {
       becomeLeader(); // no Web Locks → behave as the sole tab
     }
-
+    const send = (s) => { try { if (ws && ws.readyState === 1) { ws.send(s); return true; } } catch (_) {} return false; };
     fed = {
-      status: () => ({ ...stat }),
-      // forward a locally-originated envelope out to the relay. Only the leader
-      // has a socket; shouldFederate keeps the forwarded stream a single coherent
-      // chain (own emits + genuine other-fork organs, never a sibling tab's
-      // same-fork envelopes).
-      forward: async (env, fromEmit) => {
-        if (!stat.connected || !ws) return;
-        if (!shouldFederate(env, identity.pubHex, !!fromEmit)) return;
-        const h = await sha256hex(canonicalJSON(env));
-        if (!seen.add(h)) return;   // came from the relay, or already sent → don't echo
-        try { ws.send(JSON.stringify(env)); stat.sent++; } catch (_) { return; }
-        if (env.fork_pub === identity.pubHex && Number.isInteger(env.seq) && env.seq > hwSeq) { hwSeq = env.seq; persistHw(); }
+      status: () => ({ ...ctx.stat }),
+      forward: (env, fromEmit) => fedForward(env, fromEmit, ctx, send),
+      stop: () => {
+        ctx.stat.leader = false;
+        try { ws && ws.close(); } catch (_) {}
+        if (releaseLock) { try { releaseLock(); } catch (_) {} releaseLock = null; } // free the lock → queued tab takes over
+        fed = null;
       },
-      stop: () => { stat.leader = false; try { ws && ws.close(); } catch (_) {} fed = null; },
+    };
+    return fed;
+  }
+
+  // Sign a signal blob so it is TAMPER-EVIDENT: Ed25519 over (v,type,room,from,
+  // sha256(sdp)). A peer verifies this against the blob's own `from` before
+  // touching setRemoteDescription. This proves the SDP was not altered after the
+  // holder of `from`'s key produced it. NOTE: full MITM protection additionally
+  // requires confirming the peer's `from` fork_pub out-of-band (it travels in the
+  // blob); the signature makes that confirmation meaningful.
+  async function signSignal(sig) {
+    const body = { v: sig.v, type: sig.type, room: sig.room, from: sig.from, sdpHash: await sha256hex(sig.sdp || '') };
+    return Object.assign({}, sig, { sig: await signCanonical(identity.privKey, body) });
+  }
+  async function verifySignalSig(sig) {
+    if (!sig || typeof sig.sig !== 'string' || typeof sig.from !== 'string') return false;
+    try {
+      const pub = await crypto.subtle.importKey('raw', unhex(sig.from), { name: 'Ed25519' }, false, ['verify']);
+      const body = { v: sig.v, type: sig.type, room: sig.room, from: sig.from, sdpHash: await sha256hex(sig.sdp || '') };
+      return await crypto.subtle.verify({ name: 'Ed25519' }, pub, unhex(sig.sig), enc.encode(canonicalJSON(body)));
+    } catch (_) { return false; }
+  }
+
+  // ── carrier 2: WebRTC data channel — a RELAY-FREE, peer-to-peer transport ────
+  // Non-trickle ICE: gather all candidates, then hand back ONE offer/answer blob
+  // for out-of-band exchange (copy-paste / QR / any shared channel). No signaling
+  // server, no relay in the data path. `iceServers` (STUN) only needed for
+  // internet NAT traversal; default = host candidates (same machine / LAN), zero
+  // external dependency.
+  const RTC_BACKPRESSURE = 4 << 20; // 4 MiB buffered → treat send as failed (retryable)
+  function makeRTCCarrier({ iceServers, room }) {
+    const openCbs = [], closeCbs = [], msgCbs = [];
+    const pc = new RTCPeerConnection({ iceServers: iceServers || [] });
+    let dc = null;
+    function wire(channel) {
+      dc = channel;
+      dc.onopen = () => openCbs.forEach(f => { try { f(); } catch (_) {} });
+      dc.onclose = () => closeCbs.forEach(f => { try { f(); } catch (_) {} });
+      dc.onmessage = (e) => msgCbs.forEach(f => { try { f(e.data); } catch (_) {} });
+    }
+    pc.ondatachannel = (e) => wire(e.channel); // the answerer receives the channel
+    // wait for ICE gathering to finish (or a 3s cap) — with full listener/timer cleanup
+    function gathered() {
+      return new Promise((resolve) => {
+        if (pc.iceGatheringState === 'complete') return resolve();
+        let done = false;
+        let timer = null;
+        const finish = () => { if (done) return; done = true; clearTimeout(timer); pc.removeEventListener('icegatheringstatechange', check); resolve(); };
+        const check = () => { if (pc.iceGatheringState === 'complete') finish(); };
+        pc.addEventListener('icegatheringstatechange', check);
+        timer = setTimeout(finish, 3000); // fall back to partial candidates
+      });
+    }
+    return {
+      kind: 'rtc',
+      onOpen: (f) => openCbs.push(f), onClose: (f) => closeCbs.push(f), onMessage: (f) => msgCbs.push(f),
+      // backpressure: if the channel is congested, report a (retryable) failure
+      // instead of dropping — fedForward won't mark it seen, so it isn't lost.
+      send: (s) => { try { if (dc && dc.readyState === 'open' && dc.bufferedAmount < RTC_BACKPRESSURE) { dc.send(s); return true; } } catch (_) {} return false; },
+      close: () => { try { dc && dc.close(); } catch (_) {} try { pc.close(); } catch (_) {} },
+      createOffer: async (selfPub) => {
+        wire(pc.createDataChannel('niceassos-fed'));
+        await pc.setLocalDescription(await pc.createOffer());
+        await gathered();
+        return signSignal({ v: SIGNAL_VERSION, type: 'offer', from: selfPub, room, sdp: pc.localDescription.sdp });
+      },
+      acceptOffer: async (offerSignal, selfPub) => {
+        const chk = validSignal(offerSignal);
+        if (!chk.ok || offerSignal.type !== 'offer') throw new Error('bad offer signal: ' + chk.reason);
+        if (!(await verifySignalSig(offerSignal))) throw new Error('offer signature invalid (tampered or unsigned)');
+        await pc.setRemoteDescription({ type: 'offer', sdp: offerSignal.sdp });
+        await pc.setLocalDescription(await pc.createAnswer());
+        await gathered();
+        return signSignal({ v: SIGNAL_VERSION, type: 'answer', from: selfPub, room, sdp: pc.localDescription.sdp });
+      },
+      acceptAnswer: async (answerSignal) => {
+        const chk = validSignal(answerSignal);
+        if (!chk.ok || answerSignal.type !== 'answer') throw new Error('bad answer signal: ' + chk.reason);
+        if (!(await verifySignalSig(answerSignal))) throw new Error('answer signature invalid (tampered or unsigned)');
+        await pc.setRemoteDescription({ type: 'answer', sdp: answerSignal.sdp });
+      },
+    };
+  }
+
+  function connectFederationRTC(opts) {
+    opts = opts || {};
+    const room = opts.room || 'fed';
+    if (fed && fed.stop) { try { fed.stop(); } catch (_) {} } // one active carrier per machine
+    const ctx = makeFedContext(room, { leader: true, transport: 'rtc', role: null });
+    const carrier = makeRTCCarrier({ iceServers: opts.iceServers, room });
+    // resume seq above the high-water BEFORE the channel is marked connected, so
+    // no envelope is forwarded until the seq is guaranteed non-regressing.
+    carrier.onOpen(async () => {
+      await resumeSeqAboveHighWater(ctx);
+      ctx.stat.connected = true;
+      try { window.dispatchEvent(new CustomEvent('niceassos:fed-open', { detail: { ...ctx.stat } })); } catch (_) {}
+    });
+    carrier.onClose(() => { ctx.stat.connected = false; });
+    carrier.onMessage((data) => fedReceive(data, ctx));
+    fed = {
+      status: () => ({ ...ctx.stat }),
+      forward: (env, fromEmit) => fedForward(env, fromEmit, ctx, carrier.send),
+      stop: () => { try { carrier.close(); } catch (_) {} fed = null; },
+      // manual (relay-free) signaling — exchange these blobs out-of-band:
+      //   initiator: const offer = await fed.createOffer();  → send offer to peer
+      //   answerer:  const answer = await fed.acceptOffer(offer); → send answer back
+      //   initiator: await fed.acceptAnswer(answer);  → data channel opens
+      createOffer: () => { ctx.stat.role = 'initiator'; return carrier.createOffer(identity.pubHex); },
+      acceptOffer: (offerSignal) => { ctx.stat.role = 'answerer'; return carrier.acceptOffer(offerSignal, identity.pubHex); },
+      acceptAnswer: (answerSignal) => carrier.acceptAnswer(answerSignal),
     };
     return fed;
   }
@@ -345,7 +468,8 @@ export async function installOS(opts = {}) {
 
     // federation: join another box's mesh over a relay. Returns a handle whose
     // .status() reports { connected, sent, recv, rejected }.
-    federate: (url, room) => connectFederation(url, room),
+    federate: (url, room) => connectFederation(url, room),               // WebSocket relay carrier
+    federateRTC: (opts) => connectFederationRTC(opts || {}),             // relay-free WebRTC carrier
     federation: () => (fed ? fed.status() : { connected: false, leader: false, sent: 0, recv: 0, rejected: 0 }),
 
     manifest: () => Object.assign({}, manifest),

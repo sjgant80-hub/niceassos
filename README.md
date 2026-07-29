@@ -90,6 +90,21 @@ node integration/federation.mjs               # end-to-end proof: 2 machines, fo
 Enable it in the OS by opening `fallos.html?relay=ws://host:port/&room=fed` on
 each machine, or `installOS({ federate: { url, room } })`. See [`SPEC.md`](./SPEC.md) §6.
 
+**Or go relay-free** with the **WebRTC carrier** — a direct peer-to-peer data
+channel, no relay in the data path. Signaling is out-of-band (copy-paste one
+offer/answer blob), so no signaling server either:
+
+```js
+// machine A (initiator)          // machine B (answerer)
+const f = os.federateRTC();       const f = os.federateRTC();
+const offer  = await f.createOffer();      // → send offer to B
+                                  const answer = await f.acceptOffer(offer); // → send answer back
+await f.acceptAnswer(answer);     // channel opens → envelopes flow P2P
+```
+
+Same four-check verification, same coherence guarantees — only the wire differs.
+See [`SPEC.md`](./SPEC.md) §6b.
+
 ## What's real vs what's next
 
 **Real and verified:** the signed mesh, the blob-iframe sandbox, the hash chain,
@@ -97,9 +112,9 @@ data-driven routing, proof-of-play admission, the cascade tiering, the
 launch→signed-`fork_join` loop, and **cross-machine federation** (relay carrier +
 sign/chain/replay verification on receipt).
 
-**Next:** a WebRTC carrier (browser-to-browser, no relay) as a drop-in
-alternative transport; the full estate app set mounted as gated organs; the
-remote AI tier wired in-browser (today it's the si-didy-agent cockpit).
+**Next:** auto-signaling for WebRTC (relay brokers only the handshake, then P2P);
+the full estate app set mounted as gated organs; the remote AI tier wired
+in-browser (today it's the si-didy-agent cockpit).
 
 ## License
 
