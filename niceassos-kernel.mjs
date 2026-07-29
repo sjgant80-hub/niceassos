@@ -328,9 +328,22 @@ export function fingerprint(env, hasher = fnv1a) {
   return hasher(canonicalJSON(env));
 }
 
+// shouldFederate — the leader (federation gateway) forwarding decision. Multiple
+// OS tabs on one machine share ONE fork identity but keep independent seq
+// counters, so forwarding another tab's same-fork envelopes would collide the
+// chain at the remote. Rule:
+//   · fromEmit (this tab's own emit) → always forward (our coherent chain)
+//   · a local-mesh envelope from a DIFFERENT fork → forward (a real other organ)
+//   · a local-mesh envelope sharing OUR fork (another tab) → skip
+export function shouldFederate(env, selfPub, fromEmit) {
+  if (fromEmit) return true;
+  if (!env || typeof env.fork_pub !== 'string') return false;
+  return env.fork_pub !== selfPub;
+}
+
 export default {
   VERSION, KAPPA, KINDS, HEX64, HEX128,
   canonicalJSON, fnv1a, envelope, MeshLog,
   admit, ringGlyph, route, organEvent, cascade,
-  verifyEnvelope, FederationLedger, SeenCache, fingerprint,
+  verifyEnvelope, FederationLedger, SeenCache, fingerprint, shouldFederate,
 };

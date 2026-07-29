@@ -1814,8 +1814,11 @@ async function initMesh() {
     };
     if (relayURL) {
       os.federate(relayURL, room);
-      logEvent('MESH', `federation → ${relayURL} · room ${room} · verifying every remote envelope`);
-      window.addEventListener('niceassos:fed-open', () => logEvent('MESH', `federation OPEN · this box now shares its mesh`));
+      logEvent('MESH', `federation → ${relayURL} · room ${room} · electing leader…`);
+      window.addEventListener('niceassos:fed-open', (e) => {
+        const lead = (e.detail && e.detail.leader) ? 'LEADER' : 'follower';
+        logEvent('MESH', `federation OPEN · this tab is ${lead} · verifying every remote envelope`);
+      });
       window.addEventListener('niceassos:fed-recv', (e) => {
         const s = os.federation();
         logEvent('MESH', `⇄ FED ${e.detail.kind} from ${(e.detail.fork_pub||'?').slice(0,8)}… · recv ${s.recv} · rejected ${s.rejected}`);

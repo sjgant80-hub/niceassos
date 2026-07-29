@@ -139,11 +139,19 @@ An adversarial review of the trust boundary drove these fixes, all tested:
   fork, not by locking out all new peers.
 - **Local ingress dedup** — an envelope arriving on both the mesh and legacy
   channels is delivered to listeners once.
+- **Leader election (multi-tab).** Multiple OS tabs on one machine now federate
+  cleanly: a **Web Locks** exclusive lock (`niceassos-fed:<room>`) elects one
+  tab as the machine's federation gateway — the only tab with a relay socket and
+  the only forwarder. `shouldFederate` keeps its forwarded stream a single
+  coherent chain (own emits + genuine other-fork organs, never a sibling tab's
+  same-fork envelopes). When the leader tab closes the lock releases and a queued
+  tab takes over automatically; the new leader resumes its fork's `seq` strictly
+  above the persisted high-water (`fedhw:<room>`), so the remote sees a gap, never
+  a regression. Followers still see all remote traffic — the leader injects it
+  onto the shared local mesh. *Verified: two tabs → one relay connection; on
+  leader close the follower auto-promotes and connects.*
 
 **Known limitations (documented, not yet fixed):**
-- **One federating tab per machine.** Multiple tabs share one fork identity but
-  keep independent chains; run the OS in a single tab, or add leader election
-  (Web Locks) so one tab owns the relay socket and the chain.
 - **RFC 6455 completeness.** The codec assumes the small, single-frame, masked
   JSON messages real browser/Node clients send; it does not enforce client
   masking or reassemble fragmented (FIN=0) messages. The relay never trusts a

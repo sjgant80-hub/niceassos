@@ -67,3 +67,15 @@ these tested fixes:
 | Freshness window (±5 min) | kernel test: stale + future-dated envelopes rejected at the boundary |
 | Fork-table LRU (no lockout) | kernel test: over-cap evicts the least-recently-seen fork, accepts the new one |
 | Federation intact after hardening | remote machine verified all forwarded envelopes (`sig=true`) through the hardened relay + bridge |
+
+## Multi-tab leader election
+
+Two OS tabs opened on one machine, both with `?relay=…&room=fed`:
+
+| Claim | Evidence |
+|---|---|
+| Only the leader connects | relay reported **1 connection** with two federating tabs open |
+| Roles are exclusive | tab 1 → `{leader:true, connected:true}`; tab 2 → `{leader:false, connected:false}` |
+| Automatic failover | navigating the leader tab away → tab 2 auto-promoted to `{leader:true, connected:true}`; relay still 1 connection |
+| Coherent forwarding | `shouldFederate` unit-tested: forwards own emits + foreign forks, skips a sibling tab's same-fork envelopes |
+| No seq regression on failover | new leader resumes above the persisted `fedhw` high-water (ledger snapshot/restore unit-tested) |

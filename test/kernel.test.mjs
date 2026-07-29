@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   VERSION, KAPPA, KINDS, canonicalJSON, fnv1a, envelope, MeshLog,
   admit, ringGlyph, route, organEvent, cascade,
-  verifyEnvelope, FederationLedger, SeenCache, fingerprint,
+  verifyEnvelope, FederationLedger, SeenCache, fingerprint, shouldFederate,
 } from '../niceassos-kernel.mjs';
 
 test('KAPPA is (√5−1)/2 ≈ 0.618, not φ', () => {
@@ -378,4 +378,14 @@ test('fingerprint is a stable hash of the canonical envelope', () => {
   const e = signedEnv();
   assert.equal(fingerprint(e), fnv1a(canonicalJSON(e)));
   assert.equal(fingerprint(e), fingerprint({ ...e }));   // order-independent
+});
+
+// ─── federation: shouldFederate (leader forwarding decision) ────────────────
+test('shouldFederate forwards own emits, forwards foreign forks, skips same-fork tabs', () => {
+  const me = 'a'.repeat(64), other = 'b'.repeat(64);
+  assert.equal(shouldFederate({ fork_pub: me }, me, true), true);    // my own emit → always
+  assert.equal(shouldFederate({ fork_pub: me }, me, false), false);  // another tab, same fork → skip
+  assert.equal(shouldFederate({ fork_pub: other }, me, false), true); // a real other organ → forward
+  assert.equal(shouldFederate(null, me, false), false);              // junk → skip
+  assert.equal(shouldFederate({}, me, false), false);                // no fork_pub → skip
 });
