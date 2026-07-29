@@ -203,11 +203,37 @@ via copy-paste signaling; envelopes flowed bidirectionally, all four-check
 verified (`rejected: 0`), with the relay at **0 connections** — genuinely
 relay-free.*
 
+## §6c · WebRTC auto-signaling — relay brokers only the handshake (BUILT)
+
+`connectFederationRTCAuto` makes the WebRTC carrier turnkey: instead of
+copy-pasting blobs, the relay carries the handshake, then the data path is P2P.
+
+- **Discovery.** Both machines connect to a signaling-only relay room
+  (`rtcsig:<room>`) and announce a signed `hello`. On seeing an unknown peer a
+  node replies with its own `hello`, so join order doesn't matter.
+- **Role split (no glare).** `politePeer(self, peer)` (pure kernel) is total and
+  antisymmetric, so of any two distinct forks exactly one is *impolite* — and only
+  the impolite peer offers. The polite peer waits and answers. No offer collision.
+- **Signed handshake.** `hello`/`offer`/`answer` are Ed25519-signed and verified
+  (`validSignal` + `verifySignalSig`) before touching `RTCPeerConnection`.
+- **Relay-free data path.** Envelopes are sent over the data channel
+  (`carrier.send`); the signaling socket only ever carries handshake messages. The
+  relay never sees an envelope.
+- **One gateway per machine.** Shares the WS carrier's Web Lock
+  (`niceassos-fed:<room>`) — one tab per machine owns the P2P link.
+- **Scope.** One peer per link (2-machine). A second distinct peer's `hello` is
+  dropped; a full N-peer mesh (a carrier per peer) is future work.
+
+Enable it: `os.federateRTCAuto({ url, room, iceServers? })`, or open
+`fallos.html?rtc=ws://host:port/&room=fed` on each machine. *Verified: two
+different-origin tabs (distinct identities, no shared BroadcastChannel)
+auto-discovered, `politePeer` split the roles (offerer/answerer), a P2P channel
+opened through the relay, and envelopes flowed bidirectionally, all four-check
+verified (`rejected: 0`).*
+
 ## §7 · Non-goals for this build
 
-- Auto-signaling for WebRTC (rendezvous via the existing relay for handshake-only,
-  then P2P) — the relay-free manual path is built; auto-signaling with
-  `politePeer` glare resolution is a convenience layer on top.
+- N-peer WebRTC mesh (a carrier per peer) — the 2-machine link is built.
 - Remote AI tier in-browser (use the si-didy-agent cockpit).
 - Hard-blocking admission (logged, switchable).
 - The full estate app set mounted (FallMesh is the reference organ; the rest

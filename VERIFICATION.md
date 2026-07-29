@@ -93,3 +93,18 @@ exchanged out-of-band (copy-paste), **no relay running in the data path**:
 | No relay in the data path | relay reported **0 connections** during the entire RTC exchange |
 | Signaling is validated | `validSignal` unit-tested (offer/answer/candidate shape, bad version/from/room rejected) |
 | WS path unregressed by the refactor | tab was `{connected:true, leader:true, transport:'ws'}` before switching carriers |
+
+## WebRTC auto-signaling — relay brokers only the handshake
+
+Two **different-origin** tabs (`localhost` vs `127.0.0.1` → distinct identities,
+separate BroadcastChannel scopes — a genuine two-machine simulation), each opened
+with `?rtc=ws://localhost:17346/&room=autotest`:
+
+| Claim | Evidence |
+|---|---|
+| Auto-discovery + role split | A → `{transport:'rtc-auto', role:'offerer'}`, B → `{role:'answerer'}`; `politePeer` picked the offerer deterministically |
+| Distinct identities | A pub `c7b4acadbe`, B pub `8522d2fb6e`; each sees the other as `peer` |
+| P2P channel auto-established | both `{connected:true}` with only the relay handshake between them |
+| Envelopes flow P2P, verified | A `sent:1/recv:1`, B `sent:2/recv:2`, both `rejected:0` |
+| Relay-free data path | envelopes go `carrier.send` (data channel); the signaling socket carries only `hello`/`offer`/`answer` |
+| hello signal validated | `validSignal` unit-tested for the `hello` type (no sdp required; bad from/room rejected) |

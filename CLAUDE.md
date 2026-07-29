@@ -46,9 +46,13 @@ one sovereign browser OS. See [`README.md`](./README.md) and [`SPEC.md`](./SPEC.
   carrier only — so both stay in lockstep.
 - WebRTC (relay-free): `os.federateRTC({room, iceServers?})` → `createOffer` /
   `acceptOffer` / `acceptAnswer` (out-of-band blob exchange). `validSignal`
-  (kernel) guards the blob; envelopes are still Ed25519-verified, so signaling
-  carries no trust. Default `iceServers: []` = host candidates (LAN); add STUN
-  only for internet NAT.
+  (kernel) guards the blob; signals are Ed25519-signed/verified. Default
+  `iceServers: []` = host candidates (LAN); add STUN only for internet NAT.
+- WebRTC auto-signaling: `os.federateRTCAuto({url, room, iceServers?})` — relay
+  brokers the handshake (room `rtcsig:<room>`), then P2P. Discovery via signed
+  `hello`; `politePeer` (kernel) picks the offerer (no glare). Shares the WS
+  carrier's Web Lock (one gateway/machine). Reuses fedReceive/fedForward.
+  Scope: one peer per link. `fallos.html?rtc=ws://host:port/&room=fed`.
 - Run a relay: `node scripts/relay-server.mjs`. Federate the OS:
   `fallos.html?relay=ws://host:port/&room=fed`.
 

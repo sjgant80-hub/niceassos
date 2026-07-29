@@ -1805,6 +1805,7 @@ async function initMesh() {
     // envelope's signature + chain on receipt.
     const qs = new URLSearchParams(location.search);
     const relayURL = qs.get('relay') || localStorage.getItem('niceassos:relay');
+    const rtcURL = qs.get('rtc'); // relay used ONLY to broker the WebRTC handshake
     const room = qs.get('room') || localStorage.getItem('niceassos:room') || 'fed';
     window.federateOS = (url, r) => {
       localStorage.setItem('niceassos:relay', url);
@@ -1812,7 +1813,18 @@ async function initMesh() {
       os.federate(url, r || 'fed');
       logEvent('MESH', `federation → dialing ${url} · room ${r || 'fed'}`);
     };
-    if (relayURL) {
+    if (rtcURL) {
+      os.federateRTCAuto({ url: rtcURL, room });
+      logEvent('MESH', `federation → WebRTC auto · relay ${rtcURL} brokers handshake only · room ${room}`);
+      window.addEventListener('niceassos:fed-open', () => {
+        const s = os.federation();
+        logEvent('MESH', `federation OPEN · P2P data channel (${s.role}) · relay-free data path`);
+      });
+      window.addEventListener('niceassos:fed-recv', (e) => {
+        const s = os.federation();
+        logEvent('MESH', `⇄ P2P ${e.detail.kind} from ${(e.detail.fork_pub||'?').slice(0,8)}… · recv ${s.recv} · rejected ${s.rejected}`);
+      });
+    } else if (relayURL) {
       os.federate(relayURL, room);
       logEvent('MESH', `federation → ${relayURL} · room ${room} · electing leader…`);
       window.addEventListener('niceassos:fed-open', (e) => {

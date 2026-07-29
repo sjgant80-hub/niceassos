@@ -400,6 +400,14 @@ test('validSignal accepts a well-formed offer, answer, and candidate', () => {
   assert.equal(validSignal(offerSig({ type: 'answer' })).ok, true);
   assert.equal(validSignal(offerSig({ type: 'candidate', sdp: undefined, candidate: 'candidate:1 ...' })).ok, true);
 });
+test('validSignal accepts a hello (presence beacon, no sdp needed)', () => {
+  assert.equal(validSignal({ v: SIGNAL_VERSION, type: 'hello', from: PUB64, room: 'fed' }).ok, true);
+  // hello still needs a valid from + room
+  assert.equal(validSignal({ v: SIGNAL_VERSION, type: 'hello', from: 'short', room: 'fed' }).ok, false);
+  assert.equal(validSignal({ v: SIGNAL_VERSION, type: 'hello', from: PUB64, room: '' }).ok, false);
+  // but offer/answer without sdp are still rejected (the else-if guards them, not hello)
+  assert.equal(validSignal({ v: SIGNAL_VERSION, type: 'offer', from: PUB64, room: 'fed' }).ok, false);
+});
 test('validSignal rejects junk, wrong version, unknown type', () => {
   assert.equal(validSignal(null).ok, false);
   assert.equal(validSignal(offerSig({ v: 'nope' })).ok, false);

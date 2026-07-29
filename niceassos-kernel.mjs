@@ -349,7 +349,9 @@ export function shouldFederate(env, selfPub, fromEmit) {
 // before handing it over. (Envelope trust is unchanged: peers still Ed25519-
 // verify every envelope, so a bad signal can at worst fail to connect.)
 export const SIGNAL_VERSION = 'niceassos-rtc-1';
-export const SIGNAL_TYPES = Object.freeze(['offer', 'answer', 'candidate']);
+// hello = presence announce (auto-signaling discovery); offer/answer = SDP;
+// candidate = trickle ICE. Auto-signaling over the relay uses hello→offer→answer.
+export const SIGNAL_TYPES = Object.freeze(['hello', 'offer', 'answer', 'candidate']);
 
 export function validSignal(msg) {
   if (!msg || typeof msg !== 'object') return { ok: false, reason: 'not an object' };
@@ -359,9 +361,10 @@ export function validSignal(msg) {
   if (typeof msg.room !== 'string' || !msg.room) return { ok: false, reason: 'room required' };
   if (msg.type === 'candidate') {
     if (typeof msg.candidate !== 'string' || !msg.candidate) return { ok: false, reason: 'candidate must be a non-empty string' };
-  } else {
+  } else if (msg.type === 'offer' || msg.type === 'answer') {
     if (typeof msg.sdp !== 'string' || !msg.sdp) return { ok: false, reason: 'sdp required for offer/answer' };
   }
+  // 'hello' needs only from + room (a presence beacon carries no sdp/candidate)
   return { ok: true, reason: 'valid signal' };
 }
 

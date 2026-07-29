@@ -17,7 +17,7 @@
  */
 import {
   VERSION, SIGNAL_VERSION, MeshLog, canonicalJSON, admit, route, cascade, ringGlyph, organEvent,
-  verifyEnvelope, FederationLedger, SeenCache, fingerprint, shouldFederate, validSignal,
+  verifyEnvelope, FederationLedger, SeenCache, fingerprint, shouldFederate, validSignal, politePeer,
 } from './niceassos-kernel.mjs';
 
 const FRESHNESS_MS = 300000; // reject relayed envelopes whose ts is >5 min off — bounds reconnect-replay
@@ -271,22 +271,29 @@ export async function installOS(opts = {}) {
     return fed;
   }
 
-  // Sign a signal blob so it is TAMPER-EVIDENT: Ed25519 over (v,type,room,from,
-  // sha256(sdp)). A peer verifies this against the blob's own `from` before
-  // touching setRemoteDescription. This proves the SDP was not altered after the
-  // holder of `from`'s key produced it. NOTE: full MITM protection additionally
-  // requires confirming the peer's `from` fork_pub out-of-band (it travels in the
-  // blob); the signature makes that confirmation meaningful.
+  // Sign a signal blob so it is TAMPER-EVIDENT: Ed25519 over
+  // (v,type,room,from,to,ts,sha256(sdp)). `to` and `ts` are INSIDE the signed
+  // body so a relay cannot redirect a signed offer or replay a stale one. A peer
+  // verifies against the blob's own `from`. NOTE: full MITM protection also
+  // requires confirming the peer's `from` fork_pub out-of-band.
+  const signalBody = async (sig) => ({
+    v: sig.v, type: sig.type, room: sig.room, from: sig.from,
+    to: sig.to ?? null, ts: sig.ts ?? null, sdpHash: await sha256hex(sig.sdp || ''),
+  });
   async function signSignal(sig) {
-    const body = { v: sig.v, type: sig.type, room: sig.room, from: sig.from, sdpHash: await sha256hex(sig.sdp || '') };
-    return Object.assign({}, sig, { sig: await signCanonical(identity.privKey, body) });
+    return Object.assign({}, sig, { sig: await signCanonical(identity.privKey, await signalBody(sig)) });
   }
-  async function verifySignalSig(sig) {
+  // opts.maxSkewMs (auto-signaling) rejects a signal whose ts is stale/future →
+  // replay defense. Manual copy-paste passes no maxSkewMs (a blob may be pasted
+  // minutes later), so ts is signed but not freshness-checked there.
+  async function verifySignalSig(sig, opts = {}) {
     if (!sig || typeof sig.sig !== 'string' || typeof sig.from !== 'string') return false;
+    if (opts.maxSkewMs) {
+      if (typeof sig.ts !== 'number' || Math.abs(Date.now() - sig.ts) > opts.maxSkewMs) return false;
+    }
     try {
       const pub = await crypto.subtle.importKey('raw', unhex(sig.from), { name: 'Ed25519' }, false, ['verify']);
-      const body = { v: sig.v, type: sig.type, room: sig.room, from: sig.from, sdpHash: await sha256hex(sig.sdp || '') };
-      return await crypto.subtle.verify({ name: 'Ed25519' }, pub, unhex(sig.sig), enc.encode(canonicalJSON(body)));
+      return await crypto.subtle.verify({ name: 'Ed25519' }, pub, unhex(sig.sig), enc.encode(canonicalJSON(await signalBody(sig))));
     } catch (_) { return false; }
   }
 
@@ -326,26 +333,28 @@ export async function installOS(opts = {}) {
       // backpressure: if the channel is congested, report a (retryable) failure
       // instead of dropping — fedForward won't mark it seen, so it isn't lost.
       send: (s) => { try { if (dc && dc.readyState === 'open' && dc.bufferedAmount < RTC_BACKPRESSURE) { dc.send(s); return true; } } catch (_) {} return false; },
+      isOpen: () => !!dc && dc.readyState === 'open',
       close: () => { try { dc && dc.close(); } catch (_) {} try { pc.close(); } catch (_) {} },
-      createOffer: async (selfPub) => {
+      // extra = { to, ts } folded into the signed signal; verifyOpts = { maxSkewMs }
+      createOffer: async (selfPub, extra) => {
         wire(pc.createDataChannel('niceassos-fed'));
         await pc.setLocalDescription(await pc.createOffer());
         await gathered();
-        return signSignal({ v: SIGNAL_VERSION, type: 'offer', from: selfPub, room, sdp: pc.localDescription.sdp });
+        return signSignal(Object.assign({ v: SIGNAL_VERSION, type: 'offer', from: selfPub, room, sdp: pc.localDescription.sdp }, extra || {}));
       },
-      acceptOffer: async (offerSignal, selfPub) => {
+      acceptOffer: async (offerSignal, selfPub, extra, verifyOpts) => {
         const chk = validSignal(offerSignal);
         if (!chk.ok || offerSignal.type !== 'offer') throw new Error('bad offer signal: ' + chk.reason);
-        if (!(await verifySignalSig(offerSignal))) throw new Error('offer signature invalid (tampered or unsigned)');
+        if (!(await verifySignalSig(offerSignal, verifyOpts))) throw new Error('offer signature invalid (tampered, unsigned, or stale)');
         await pc.setRemoteDescription({ type: 'offer', sdp: offerSignal.sdp });
         await pc.setLocalDescription(await pc.createAnswer());
         await gathered();
-        return signSignal({ v: SIGNAL_VERSION, type: 'answer', from: selfPub, room, sdp: pc.localDescription.sdp });
+        return signSignal(Object.assign({ v: SIGNAL_VERSION, type: 'answer', from: selfPub, room, sdp: pc.localDescription.sdp }, extra || {}));
       },
-      acceptAnswer: async (answerSignal) => {
+      acceptAnswer: async (answerSignal, verifyOpts) => {
         const chk = validSignal(answerSignal);
         if (!chk.ok || answerSignal.type !== 'answer') throw new Error('bad answer signal: ' + chk.reason);
-        if (!(await verifySignalSig(answerSignal))) throw new Error('answer signature invalid (tampered or unsigned)');
+        if (!(await verifySignalSig(answerSignal, verifyOpts))) throw new Error('answer signature invalid (tampered, unsigned, or stale)');
         await pc.setRemoteDescription({ type: 'answer', sdp: answerSignal.sdp });
       },
     };
@@ -377,6 +386,117 @@ export async function installOS(opts = {}) {
       createOffer: () => { ctx.stat.role = 'initiator'; return carrier.createOffer(identity.pubHex); },
       acceptOffer: (offerSignal) => { ctx.stat.role = 'answerer'; return carrier.acceptOffer(offerSignal, identity.pubHex); },
       acceptAnswer: (answerSignal) => carrier.acceptAnswer(answerSignal),
+    };
+    return fed;
+  }
+
+  // ── carrier 3: WebRTC AUTO-signaling — the relay brokers ONLY the handshake ──
+  // Both machines connect to a signaling-only relay room, discover each other via
+  // signed `hello`, and politePeer picks exactly one offerer. Signed offer/answer
+  // flow through the relay; once the data channel opens, envelopes go peer-to-peer
+  // and the relay never touches envelope data. Web Locks elects one gateway tab
+  // per machine. The handshake SELF-HEALS: a lost frame or a failed/closed channel
+  // trips a negotiation timeout that tears down and re-announces, and the peer
+  // binding is tentative (freed on timeout) so a silent/hostile peer that grabs
+  // the slot cannot permanently lock out the real machine. opts.peer pins an
+  // expected peer fork_pub (a hard allow-list). Scope: one peer per link.
+  const SIGNAL_SKEW_MS = 60000; // reject signals whose ts is >1 min off (replay defense)
+  const NEGO_TIMEOUT_MS = 12000; // no open data channel within this → tear down + restart
+  function connectFederationRTCAuto(opts) {
+    opts = opts || {};
+    const room = opts.room || 'fed';
+    if (!opts.url) throw new Error('federateRTCAuto needs { url } (a relay for signaling)');
+    if (fed && fed.stop) { try { fed.stop(); } catch (_) {} } // one active carrier per machine
+    const expectPeer = typeof opts.peer === 'string' ? opts.peer : null;
+    const sigRoom = 'rtcsig:' + room; // isolate signaling from any WS-carrier envelope room
+    const wsurl = opts.url + (opts.url.includes('?') ? '&' : '?') + 'room=' + encodeURIComponent(sigRoom);
+    const ctx = makeFedContext(room, { leader: false, transport: 'rtc-auto', role: null, peer: null });
+    let sigWs = null, carrier = null, releaseLock = null, peer = null, negoTimer = null, stopped = false;
+
+    function sigSend(obj) { try { if (sigWs && sigWs.readyState === 1) sigWs.send(JSON.stringify(obj)); } catch (_) {} }
+    async function hello(to) {
+      const h = { v: SIGNAL_VERSION, type: 'hello', from: identity.pubHex, room, ts: Date.now() };
+      if (to) h.to = to;
+      sigSend(await signSignal(h));
+    }
+    function clearNego() { if (negoTimer) { clearTimeout(negoTimer); negoTimer = null; } }
+    // tear down a stalled/closed link and re-open the slot for (re)discovery
+    function resetLink(reannounce) {
+      clearNego();
+      try { carrier && carrier.close(); } catch (_) {}
+      carrier = null; peer = null; ctx.stat.peer = null; ctx.stat.role = null; ctx.stat.connected = false;
+      if (reannounce && !stopped) hello();
+    }
+    function armNegoTimeout() {
+      clearNego();
+      negoTimer = setTimeout(() => { if (!stopped && (!carrier || !carrier.isOpen())) resetLink(true); }, NEGO_TIMEOUT_MS);
+    }
+    function wireCarrier() {
+      carrier.onOpen(async () => { clearNego(); await resumeSeqAboveHighWater(ctx); ctx.stat.connected = true; try { window.dispatchEvent(new CustomEvent('niceassos:fed-open', { detail: { ...ctx.stat } })); } catch (_) {} });
+      carrier.onClose(() => { if (!stopped) resetLink(true); }); // dropped channel → restart handshake
+      carrier.onMessage((data) => fedReceive(data, ctx));
+    }
+    async function startOffer(peerPub) {
+      if (carrier) return;
+      peer = peerPub; ctx.stat.peer = peerPub; ctx.stat.role = 'offerer';
+      carrier = makeRTCCarrier({ iceServers: opts.iceServers, room });
+      wireCarrier();
+      armNegoTimeout(); // if no answer / no channel in time → resetLink + re-hello
+      const offer = await carrier.createOffer(identity.pubHex, { to: peerPub, ts: Date.now() });
+      sigSend(offer);
+    }
+    async function onSignal(msg) {
+      if (!validSignal(msg).ok) return;
+      if (msg.from === identity.pubHex) return;         // our own echo (or same-identity tab)
+      if (msg.to && msg.to !== identity.pubHex) return; // directed elsewhere
+      if (expectPeer && msg.from !== expectPeer) return;// allow-list: only the expected peer
+      if (peer && msg.from !== peer) return;            // one peer per link (2-machine scope)
+      if (!(await verifySignalSig(msg, { maxSkewMs: SIGNAL_SKEW_MS }))) return; // tampered / unsigned / stale
+      if (msg.type === 'hello') {
+        if (!peer) await hello(msg.from);               // reply so a late-joiner learns us
+        // impolite peer offers; polite peer records the peer and waits for the offer
+        if (!politePeer(identity.pubHex, msg.from)) { if (!carrier) await startOffer(msg.from); }
+        else if (!peer) { peer = msg.from; ctx.stat.peer = msg.from; armNegoTimeout(); } // wait for offer, bounded
+        return;
+      }
+      if (msg.type === 'offer') {
+        if (carrier && carrier.isOpen()) return;        // already connected → ignore new offers
+        if (carrier) resetLink(false);                  // stalled prior attempt → rebuild for this offer
+        peer = msg.from; ctx.stat.peer = msg.from; ctx.stat.role = 'answerer';
+        carrier = makeRTCCarrier({ iceServers: opts.iceServers, room });
+        wireCarrier();
+        armNegoTimeout();
+        const answer = await carrier.acceptOffer(msg, identity.pubHex, { to: msg.from, ts: Date.now() }, { maxSkewMs: SIGNAL_SKEW_MS });
+        sigSend(answer);
+        return;
+      }
+      if (msg.type === 'answer') {
+        if (!carrier || ctx.stat.role !== 'offerer') return;
+        try { await carrier.acceptAnswer(msg, { maxSkewMs: SIGNAL_SKEW_MS }); } catch (_) {}
+      }
+    }
+    function openSignaling() {
+      try { sigWs = new WebSocket(wsurl); } catch (_) { return; }
+      sigWs.onopen = () => { hello(); };                // announce presence
+      sigWs.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch (_) { return; } if (m && m.v === SIGNAL_VERSION) onSignal(m); };
+      sigWs.onclose = () => { if (!stopped && ctx.stat.leader && fed) setTimeout(() => { if (!stopped && ctx.stat.leader && fed) openSignaling(); }, 2000); };
+      sigWs.onerror = () => {};
+    }
+    function becomeLeader() { ctx.stat.leader = true; openSignaling(); }
+    const lockName = 'niceassos-fed:' + room; // shared with the WS carrier → one gateway tab/machine
+    if (typeof navigator !== 'undefined' && navigator.locks && navigator.locks.request) {
+      navigator.locks.request(lockName, { mode: 'exclusive' }, () => new Promise((resolve) => { releaseLock = resolve; becomeLeader(); })).catch(() => {});
+    } else { becomeLeader(); }
+    fed = {
+      status: () => ({ ...ctx.stat }),
+      forward: (env, fromEmit) => fedForward(env, fromEmit, ctx, (s) => (carrier ? carrier.send(s) : false)),
+      stop: () => {
+        stopped = true; ctx.stat.leader = false; clearNego();
+        try { sigWs && sigWs.close(); } catch (_) {}
+        try { carrier && carrier.close(); } catch (_) {}
+        if (releaseLock) { try { releaseLock(); } catch (_) {} releaseLock = null; }
+        fed = null;
+      },
     };
     return fed;
   }
@@ -469,7 +589,8 @@ export async function installOS(opts = {}) {
     // federation: join another box's mesh over a relay. Returns a handle whose
     // .status() reports { connected, sent, recv, rejected }.
     federate: (url, room) => connectFederation(url, room),               // WebSocket relay carrier
-    federateRTC: (opts) => connectFederationRTC(opts || {}),             // relay-free WebRTC carrier
+    federateRTC: (opts) => connectFederationRTC(opts || {}),             // relay-free WebRTC (manual signaling)
+    federateRTCAuto: (opts) => connectFederationRTCAuto(opts || {}),     // WebRTC, relay brokers only the handshake
     federation: () => (fed ? fed.status() : { connected: false, leader: false, sent: 0, recv: 0, rejected: 0 }),
 
     manifest: () => Object.assign({}, manifest),
