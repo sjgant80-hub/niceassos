@@ -428,3 +428,13 @@ test('politePeer picks the lexicographically smaller fork, guards non-strings', 
   assert.equal(politePeer('a'.repeat(64), 'a'.repeat(64)), false);  // equal → not polite (guards < vs <=)
   assert.equal(politePeer(null, 'a'.repeat(64)), false);
 });
+
+// ── 2026-08-27 gate-hardening ──
+test('politePeer refuses ANY non-string pair — two numbers never elect a polite peer', () => {
+  assert.equal(politePeer(123, 456), false, 'both-numeric must refuse, not compare');
+  assert.equal(politePeer('5', 100), false, 'a numeric STRING beside a number must refuse — coercion would elect it politely');
+  assert.equal(politePeer(100, '5'), false);
+  assert.equal(politePeer('a', 123), false);
+  assert.equal(politePeer(123, 'a'), false);
+  assert.equal(politePeer('a', 'b'), true);
+});

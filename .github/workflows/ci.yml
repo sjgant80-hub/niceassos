@@ -14,3 +14,14 @@ jobs:
           node-version: '20'
       - name: kernel test suite
         run: node --test
+      # ⚑ Pinned. An unpinned gate is a gate somebody else can change.
+      - name: witness — try to break niceassos-kernel.mjs, then READ the verdict (must be CLEAN)
+        run: |
+          git clone --depth 1 --branch v0.6 https://github.com/sjgant80-hub/witness.git /tmp/witness
+          node /tmp/witness/witness.mjs mutate niceassos-kernel.mjs             --timeout 60000 --cap 500 --baseline witness.baseline.json             --test node --test test/kernel.test.mjs | tee verdict.txt
+          grep -q '"clean": true' verdict.txt || { echo "::error::mutants survived — the gate is not clean"; exit 1; }
+      # ⚑ Pinned. An unpinned gate is a gate somebody else can change.
+      - name: witness — try to break niceassos-relay.mjs, then READ the verdict (must be CLEAN)
+        run: |
+          node /tmp/witness/witness.mjs mutate niceassos-relay.mjs             --timeout 60000 --cap 500 --baseline witness.baseline.json             --test node --test test/relay.test.mjs | tee verdict.txt
+          grep -q '"clean": true' verdict.txt || { echo "::error::mutants survived — the gate is not clean"; exit 1; }
