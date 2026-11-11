@@ -5,7 +5,7 @@
 `niceassos-mesh` (Ed25519 envelopes, hash-chained) — with proof-of-play
 admission, data-driven cross-organ routing, and a local-first brain.
 
-Architecture: Thomas Frumkin · Implementation: Simon Gant · ◊·κ=1
+Architecture: Thomas Frumkin · Implementation: Simon Gant
 
 ---
 
